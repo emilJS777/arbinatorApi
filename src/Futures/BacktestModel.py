@@ -1,0 +1,72 @@
+from datetime import datetime
+
+from src import db
+from src.__Parents.Model import Model
+
+
+class BacktestRun(Model, db.Model):
+    exchange = db.Column(db.String(80), nullable=False)
+    symbol = db.Column(db.String(40), nullable=False)
+    timeframe = db.Column(db.String(10), nullable=False)
+    start_date = db.Column(db.DateTime, nullable=True)
+    end_date = db.Column(db.DateTime, nullable=True)
+    trades_count = db.Column(db.Integer, default=0, nullable=False)
+    total_pnl = db.Column(db.Float, default=0, nullable=False)
+    win_rate = db.Column(db.Float, default=0, nullable=False)
+    profit_factor = db.Column(db.Float, default=0, nullable=False)
+    max_drawdown = db.Column(db.Float, default=0, nullable=False)
+    sharpe_ratio = db.Column(db.Float, default=0, nullable=False)
+    expectancy = db.Column(db.Float, default=0, nullable=False)
+    sortino_ratio = db.Column(db.Float, default=0, nullable=False)
+    recovery_factor = db.Column(db.Float, default=0, nullable=False)
+    average_holding_minutes = db.Column(db.Float, default=0, nullable=False)
+    longest_losing_streak = db.Column(db.Integer, default=0, nullable=False)
+    longest_winning_streak = db.Column(db.Integer, default=0, nullable=False)
+    average_r_multiple = db.Column(db.Float, default=0, nullable=False)
+    config_json = db.Column(db.JSON, nullable=True)
+    equity_curve_json = db.Column(db.JSON, nullable=True)
+    drawdown_curve_json = db.Column(db.JSON, nullable=True)
+    monthly_returns_json = db.Column(db.JSON, nullable=True)
+    monte_carlo_json = db.Column(db.JSON, nullable=True)
+    walk_forward_json = db.Column(db.JSON, nullable=True)
+    optimization_json = db.Column(db.JSON, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+
+class BacktestTrade(Model, db.Model):
+    backtest_run_id = db.Column(db.Integer, db.ForeignKey("backtest_run.id"), nullable=False)
+    entry_time = db.Column(db.DateTime, nullable=False)
+    exit_time = db.Column(db.DateTime, nullable=False)
+    side = db.Column(db.String(20), nullable=False)
+    entry_price = db.Column(db.Float, nullable=False)
+    exit_price = db.Column(db.Float, nullable=False)
+    pnl = db.Column(db.Float, default=0, nullable=False)
+    pnl_percent = db.Column(db.Float, default=0, nullable=False)
+    r_multiple = db.Column(db.Float, default=0, nullable=False)
+    reason = db.Column(db.String(40), nullable=True)
+
+
+class StrategyCandidate(Model, db.Model):
+    exchange = db.Column(db.String(80), nullable=False)
+    symbol = db.Column(db.String(40), nullable=False)
+    timeframe = db.Column(db.String(10), nullable=False)
+    period_days = db.Column(db.Integer, nullable=False)
+    parameters = db.Column(db.JSON, nullable=False)
+    profit_factor = db.Column(db.Float, default=0, nullable=False)
+    win_rate = db.Column(db.Float, default=0, nullable=False)
+    expectancy = db.Column(db.Float, default=0, nullable=False)
+    max_drawdown = db.Column(db.Float, default=0, nullable=False)
+    max_drawdown_percent = db.Column(db.Float, default=0, nullable=False)
+    sharpe = db.Column(db.Float, default=0, nullable=False)
+    trades_count = db.Column(db.Integer, default=0, nullable=False)
+    stability_score = db.Column(db.Float, default=0, nullable=False)
+    profit_factor_score = db.Column(db.Float, default=0, nullable=False)
+    drawdown_score = db.Column(db.Float, default=0, nullable=False)
+    sharpe_score = db.Column(db.Float, default=0, nullable=False)
+    walk_forward_score = db.Column(db.Float, default=0, nullable=False)
+    rejection_reasons = db.Column(db.JSON, nullable=True)
+    equity_curve_json = db.Column(db.JSON, nullable=True)
+    drawdown_curve_json = db.Column(db.JSON, nullable=True)
+    monte_carlo_json = db.Column(db.JSON, nullable=True)
+    walk_forward_json = db.Column(db.JSON, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)

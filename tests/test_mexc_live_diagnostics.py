@@ -235,6 +235,12 @@ def test_mexc_order_submit_drycheck_builds_expected_body_and_does_not_send(clien
         "json_price_zero",
         "json_price_current",
         "json_integer_vol",
+        "json_type6_price_omitted",
+        "json_type6_price_zero",
+        "json_type6_price_current",
+        "json_type6_integer_vol",
+        "form_urlencoded_type6",
+        "json_type6_user_agent",
         "json_no_source",
         "json_user_agent",
         "form_urlencoded",
@@ -247,6 +253,26 @@ def test_mexc_order_submit_drycheck_builds_expected_body_and_does_not_send(clien
     assert payload["submit_format_requests"]["json_price_current"]["body"]["price"] == 65000
     assert isinstance(payload["submit_format_requests"]["json_integer_vol"]["body"]["vol"], int)
     assert payload["submit_format_requests"]["json_integer_vol"]["serialized_body"] == '{"symbol":"BTC_USDT","vol":10,"type":5,"openType":1,"side":1,"leverage":1,"price":100}'
+    assert "price" not in payload["submit_format_requests"]["json_type6_price_omitted"]["body"]
+    assert payload["submit_format_requests"]["json_type6_price_omitted"]["body"]["type"] == 6
+    assert payload["submit_format_requests"]["json_type6_price_zero"]["body"]["type"] == 6
+    assert payload["submit_format_requests"]["json_type6_price_zero"]["body"]["price"] == 0
+    assert payload["submit_format_requests"]["json_type6_price_current"]["body"]["type"] == 6
+    assert payload["submit_format_requests"]["json_type6_price_current"]["body"]["price"] == 65000
+    assert payload["submit_format_requests"]["json_type6_integer_vol"]["body"] == {
+        "symbol": "BTC_USDT",
+        "vol": 10,
+        "type": 6,
+        "openType": 1,
+        "side": 1,
+        "leverage": 1,
+        "price": 100,
+    }
+    assert payload["submit_format_requests"]["json_type6_integer_vol"]["serialized_body"] == '{"symbol":"BTC_USDT","vol":10,"type":6,"openType":1,"side":1,"leverage":1,"price":100}'
+    assert payload["submit_format_requests"]["form_urlencoded_type6"]["content_type"] == "application/x-www-form-urlencoded"
+    assert "type=6" in payload["submit_format_requests"]["form_urlencoded_type6"]["serialized_body"]
+    assert payload["submit_format_requests"]["json_type6_user_agent"]["body"]["type"] == 6
+    assert payload["submit_format_requests"]["json_type6_user_agent"]["user_agent_used"].startswith("Mozilla/5.0")
     assert payload["submit_format_requests"]["json_no_source"]["headers_names_used"] == ["ApiKey", "Content-Type", "Request-Time", "Signature"]
     assert "User-Agent" in payload["submit_format_requests"]["json_user_agent"]["headers_names_used"]
     assert payload["submit_format_requests"]["json_user_agent"]["user_agent_used"].startswith("Mozilla/5.0")
@@ -259,6 +285,8 @@ def test_mexc_order_submit_drycheck_builds_expected_body_and_does_not_send(clien
     assert payload["volume_details"]["min_vol"] == 1
     assert payload["volume_details"]["api_allowed"] is True
     assert payload["order_type_mapping"]["mexc_type"] == 5
+    assert payload["api_format_notes"]["mexc_docs_market_order_type"] == 5
+    assert payload["api_format_notes"]["ccxt_mexc_swap_market_order_type"] == 6
     assert payload["side_mapping"]["mexc_side"] == 1
     assert "api-key-value" not in str(payload)
     assert "secret-value" not in str(payload)
@@ -387,6 +415,57 @@ def test_mexc_order_submit_form_urlencoded_signs_exact_sent_body(client):
     assert payload["real_order_request"]["signature_payload_preview"].endswith(sent["data"])
     assert "symbol=BTC_USDT" in sent["data"]
     assert "price=100" in sent["data"]
+
+
+def test_mexc_order_submit_type6_variant_sends_exact_variant(client):
+    seed_mexc()
+    requests_client = FakeOrderSubmitRequests()
+    service = MexcOrderSubmitDryCheckService(
+        live_execution_service=LiveExecutionService(client_factory=lambda _exchange: FakeMexcClient({"apiKey": "api-key-value", "secret": "secret-value"}), requests_client=requests_client)
+    )
+
+    payload = service.run({
+        "confirm_real_order_test": True,
+        "submit_format": "json_type6_price_omitted",
+        "symbol": "BTC/USDT",
+        "margin_usdt": 1,
+        "leverage": 1,
+        "side": "long",
+        "price": 100,
+    }).get_json()["obj"]
+
+    sent = requests_client.calls[1]
+    assert payload["real_order_submit_format"] == "json_type6_price_omitted"
+    assert payload["real_order_request"]["body"]["type"] == 6
+    assert "price" not in payload["real_order_request"]["body"]
+    assert sent["data"] == payload["real_order_request"]["serialized_body"]
+    assert '"type":6' in sent["data"]
+    assert '"price"' not in sent["data"]
+
+
+def test_mexc_order_submit_type6_form_urlencoded_sends_exact_variant(client):
+    seed_mexc()
+    requests_client = FakeOrderSubmitRequests()
+    service = MexcOrderSubmitDryCheckService(
+        live_execution_service=LiveExecutionService(client_factory=lambda _exchange: FakeMexcClient({"apiKey": "api-key-value", "secret": "secret-value"}), requests_client=requests_client)
+    )
+
+    payload = service.run({
+        "confirm_real_order_test": True,
+        "submit_format": "form_urlencoded_type6",
+        "symbol": "BTC/USDT",
+        "margin_usdt": 1,
+        "leverage": 1,
+        "side": "long",
+        "price": 100,
+    }).get_json()["obj"]
+
+    sent = requests_client.calls[1]
+    assert payload["real_order_submit_format"] == "form_urlencoded_type6"
+    assert sent["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
+    assert sent["data"] == payload["real_order_request"]["serialized_body"]
+    assert "type=6" in sent["data"]
+    assert payload["real_order_request"]["signature_payload_preview"].endswith(sent["data"])
 
 
 def test_mexc_order_submit_drycheck_route(client, monkeypatch):

@@ -19,6 +19,12 @@ class MexcOrderSubmitDryCheckService(Response):
         "json_price_zero",
         "json_price_current",
         "json_integer_vol",
+        "json_type6_price_omitted",
+        "json_type6_price_zero",
+        "json_type6_price_current",
+        "json_type6_integer_vol",
+        "form_urlencoded_type6",
+        "json_type6_user_agent",
         "json_no_source",
         "json_user_agent",
         "form_urlencoded",
@@ -132,6 +138,11 @@ class MexcOrderSubmitDryCheckService(Response):
         next_body["price"] = price
         return next_body
 
+    def body_with_type(self, body, order_type):
+        next_body = dict(body)
+        next_body["type"] = order_type
+        return next_body
+
     def direct_signed_request(self, client, body, content_type="application/json", include_source=True, user_agent=None):
         signed = client.sign("order/submit", api=["contract", "private"], method="POST", params=body)
         headers = dict(signed.get("headers") or {})
@@ -175,6 +186,32 @@ class MexcOrderSubmitDryCheckService(Response):
             "json_price_zero": self.direct_signed_request(client, self.body_with_price(integer_body, 0)),
             "json_price_current": self.direct_signed_request(client, current_price_body),
             "json_integer_vol": self.direct_signed_request(client, integer_body),
+            "json_type6_price_omitted": self.direct_signed_request(
+                client,
+                self.body_without_price(self.body_with_type(integer_body, 6)),
+            ),
+            "json_type6_price_zero": self.direct_signed_request(
+                client,
+                self.body_with_price(self.body_with_type(integer_body, 6), 0),
+            ),
+            "json_type6_price_current": self.direct_signed_request(
+                client,
+                self.body_with_type(current_price_body, 6),
+            ),
+            "json_type6_integer_vol": self.direct_signed_request(
+                client,
+                self.body_with_type(integer_body, 6),
+            ),
+            "form_urlencoded_type6": self.direct_signed_request(
+                client,
+                self.body_with_type(integer_body, 6),
+                content_type="application/x-www-form-urlencoded",
+            ),
+            "json_type6_user_agent": self.direct_signed_request(
+                client,
+                self.body_with_type(integer_body, 6),
+                user_agent=browser_user_agent,
+            ),
             "ccxt_raw_request": signed,
             "json_no_source": self.direct_signed_request(client, body, include_source=False),
             "json_user_agent": self.direct_signed_request(client, integer_body, user_agent=browser_user_agent),
@@ -252,8 +289,10 @@ class MexcOrderSubmitDryCheckService(Response):
                     "endpoint_expected": "https://contract.mexc.com/api/v1/private/order/submit",
                     "signature_method": "ApiKey + Request-Time + exact serialized body",
                     "body_serialization": "diagnostics include JSON and form-urlencoded alternatives",
-                    "market_order_type": 5,
+                    "mexc_docs_market_order_type": 5,
+                    "ccxt_mexc_swap_market_order_type": 6,
                     "market_price_variants": ["price omitted", "price=0", "price=current mark/last/current"],
+                    "type6_hypothesis": "ccxt maps MEXC swap market orders to type=6 (convert market price to current price)",
                     "volume_format": "diagnostics include integer contract vol when integral",
                     "side_values": {
                         "open_long": 1,

@@ -1,6 +1,8 @@
 from src import db
 from src.Exchange.ExchangeModel import Exchange
 from src.Live.MexcDiagnosticsService import MexcDiagnosticsService
+from src.Live.MexcOrderSubmitDryCheckService import MexcOrderSubmitDryCheckService
+from src.OrderBookRecovery.LiveExecutionService import LiveExecutionService
 
 
 class FakeResponse:
@@ -30,6 +32,21 @@ class FakeRequests:
         return FakeResponse(200, '{"success":true,"data":[{"currency":"USDT"}]}')
 
 
+class FakeOrderSubmitRequests:
+    def __init__(self):
+        self.calls = []
+
+    def request(self, method, url, headers=None, data=None, timeout=None):
+        self.calls.append({
+            "method": method,
+            "url": url,
+            "headers": headers or {},
+            "data": data,
+            "timeout": timeout,
+        })
+        return FakeResponse(200, '{"code":200,"data":"dry-real-order-id"}')
+
+
 class FakeMexcClient:
     has = {"fetchPositions": True}
 
@@ -44,16 +61,43 @@ class FakeMexcClient:
     def fetch_positions(self):
         return []
 
+    def load_markets(self):
+        return {
+            "BTC/USDT:USDT": {
+                "id": "BTC_USDT",
+                "symbol": "BTC/USDT:USDT",
+                "swap": True,
+                "contract": True,
+                "linear": True,
+                "base": "BTC",
+                "quote": "USDT",
+                "settle": "USDT",
+                "contractSize": 0.001,
+                "type": "swap",
+            }
+        }
+
+    def amount_to_precision(self, _symbol, amount):
+        return amount
+
+    def price_to_precision(self, _symbol, price):
+        return price
+
     def sign(self, path, api=None, method="GET", params=None):
+        body = None
+        if method == "POST":
+            import json
+            body = json.dumps(params or {}, separators=(",", ":"))
         return {
             "url": f"https://contract.mexc.com/api/v1/private/{path}",
             "method": method,
-            "body": None,
+            "body": body,
             "headers": {
                 "ApiKey": self.apiKey,
                 "Request-Time": "123",
-                "Signature": "secret-signature-value",
+                "Signature": f"signature-for:{body}",
                 "Content-Type": "application/json",
+                "source": "CCXT",
             },
         }
 
@@ -89,7 +133,7 @@ def test_mexc_diagnostics_success_is_read_only_and_redacted(client):
     assert payload["raw_private_account_ok"] is True
     assert payload["private_endpoint_path"] == "account/assets"
     assert "order" not in payload["private_endpoint_path"]
-    assert payload["headers_names_used"] == ["ApiKey", "Content-Type", "Request-Time", "Signature"]
+    assert payload["headers_names_used"] == ["ApiKey", "Content-Type", "Request-Time", "Signature", "source"]
     serialized = str(payload)
     assert "api-key-value" not in serialized
     assert "secret-value" not in serialized
@@ -131,3 +175,98 @@ def test_mexc_diagnostics_route_uses_safe_endpoint(client, monkeypatch):
     assert payload["raw_private_account_ok"] is True
     assert any("account/assets" in url for url in payload["actual_endpoint_urls_used"])
     assert not any("order/submit" in url for url in payload["actual_endpoint_urls_used"])
+
+
+def test_mexc_order_submit_drycheck_builds_expected_body_and_does_not_send(client):
+    seed_mexc()
+    requests_client = FakeOrderSubmitRequests()
+    service = MexcOrderSubmitDryCheckService(
+        live_execution_service=LiveExecutionService(client_factory=lambda _exchange: FakeMexcClient({"apiKey": "api-key-value", "secret": "secret-value"}), requests_client=requests_client)
+    )
+
+    payload = service.run({
+        "symbol": "BTC/USDT",
+        "margin_usdt": 1,
+        "leverage": 1,
+        "side": "long",
+        "price": 100,
+    }).get_json()["obj"]
+
+    assert payload["dry_run"] is True
+    assert requests_client.calls == []
+    assert payload["endpoint"] == "https://contract.mexc.com/api/v1/private/order/submit"
+    assert payload["method"] == "POST"
+    assert payload["body"]["symbol"] == "BTC_USDT"
+    assert payload["body"]["price"] == 100
+    assert payload["body"]["vol"] == 10
+    assert payload["body"]["side"] == 1
+    assert payload["body"]["type"] == 5
+    assert payload["body"]["openType"] == 1
+    assert payload["body"]["leverage"] == 1
+    assert payload["order_type_mapping"]["mexc_type"] == 5
+    assert payload["side_mapping"]["mexc_side"] == 1
+    assert "api-key-value" not in str(payload)
+    assert "secret-value" not in str(payload)
+
+
+def test_mexc_order_submit_short_side_mapping(client):
+    seed_mexc()
+    service = MexcOrderSubmitDryCheckService(
+        live_execution_service=LiveExecutionService(client_factory=lambda _exchange: FakeMexcClient({"apiKey": "api-key-value", "secret": "secret-value"}), requests_client=FakeOrderSubmitRequests())
+    )
+
+    payload = service.run({
+        "symbol": "BTC/USDT",
+        "margin_usdt": 1,
+        "leverage": 1,
+        "side": "short",
+        "price": 100,
+    }).get_json()["obj"]
+
+    assert payload["body"]["side"] == 3
+    assert payload["side_mapping"]["mexc_side"] == 3
+
+
+def test_mexc_order_submit_signature_payload_matches_sent_body(client):
+    seed_mexc()
+    requests_client = FakeOrderSubmitRequests()
+    service = MexcOrderSubmitDryCheckService(
+        live_execution_service=LiveExecutionService(client_factory=lambda _exchange: FakeMexcClient({"apiKey": "api-key-value", "secret": "secret-value"}), requests_client=requests_client)
+    )
+
+    payload = service.run({
+        "confirm_real_order_test": True,
+        "symbol": "BTC/USDT",
+        "margin_usdt": 1,
+        "leverage": 1,
+        "side": "long",
+        "price": 100,
+    }).get_json()["obj"]
+
+    sent = requests_client.calls[0]
+    assert payload["confirm_real_order_test"] is True
+    assert payload["real_order_sent"] is True
+    assert sent["url"] == payload["endpoint"]
+    assert sent["method"] == "POST"
+    assert sent["data"] == payload["serialized_body"]
+    assert payload["signature_payload_preview"].endswith(payload["serialized_body"])
+    assert set(payload["headers_names_used"]) == {"ApiKey", "Content-Type", "Request-Time", "Signature", "source"}
+
+
+def test_mexc_order_submit_drycheck_route(client, monkeypatch):
+    seed_mexc()
+    fake_ccxt = FakeCcxt()
+    monkeypatch.setattr("src.OrderBookRecovery.LiveExecutionService.ccxt", fake_ccxt)
+
+    response = client.post("/api/live/mexc-order-submit-drycheck", json={
+        "symbol": "BTC/USDT",
+        "margin_usdt": 1,
+        "leverage": 1,
+        "side": "long",
+        "price": 100,
+    })
+    payload = response.get_json()["obj"]
+
+    assert response.status_code == 200
+    assert payload["dry_run"] is True
+    assert payload["body"]["type"] == 5

@@ -3,6 +3,7 @@ import logging
 import os
 
 import ccxt
+import requests
 
 from src.Exchange.ExchangeModel import Exchange
 
@@ -15,8 +16,9 @@ logger = logging.getLogger(__name__)
 
 
 class LiveExecutionService:
-    def __init__(self, client_factory=None):
+    def __init__(self, client_factory=None, requests_client=None):
         self.client_factory = client_factory
+        self.requests = requests_client or requests
 
     def hard_disabled(self):
         return str(os.environ.get("LIVE_TRADING_HARD_DISABLED", "false")).lower() == "true"
@@ -209,6 +211,13 @@ class LiveExecutionService:
             return 2 if side == "buy" else 4
         return 1 if side == "buy" else 3
 
+    def mexc_order_type(self, order_type):
+        if order_type == "market":
+            return 5
+        if order_type == "limit":
+            return 1
+        return order_type
+
     def ensure_mexc_response_ok(self, response):
         if not isinstance(response, dict):
             return
@@ -217,13 +226,11 @@ class LiveExecutionService:
         if success is False or (code not in (None, 0, 200, "0", "200")):
             raise LiveExecutionError(f"live_mexc_order_failed:{response}")
 
-    def create_mexc_swap_order(self, client, market, order_type, side, amount, price=None, reduce_only=False, leverage=None):
-        if not hasattr(client, "contractPrivatePostOrderSubmit"):
-            raise LiveExecutionError("live_mexc_contract_order_endpoint_unavailable")
+    def build_mexc_order_submit_request(self, client, market, order_type, side, amount, price=None, reduce_only=False, leverage=None):
         symbol = market.get("symbol")
-        request_type = 6 if order_type == "market" else 1
+        request_type = self.mexc_order_type(order_type)
         vol = self.amount_to_precision(client, symbol, self.contract_amount(market, amount))
-        request = {
+        body = {
             "symbol": market.get("id") or symbol,
             "vol": vol,
             "type": request_type,
@@ -231,13 +238,71 @@ class LiveExecutionService:
             "side": self.mexc_swap_side(side, reduce_only),
         }
         if leverage:
-            request["leverage"] = int(leverage)
-        if request_type != 6 and price is not None:
-            request["price"] = self.price_to_precision(client, symbol, price)
+            body["leverage"] = int(leverage)
+        if price is not None:
+            body["price"] = self.price_to_precision(client, symbol, price)
 
-        response = client.contractPrivatePostOrderSubmit(request)
-        self.ensure_mexc_response_ok(response)
+        signed = client.sign("order/submit", api=["contract", "private"], method="POST", params=body)
+        headers = signed.get("headers") or {}
+        serialized_body = signed.get("body")
+        return {
+            "endpoint": signed["url"],
+            "method": signed.get("method") or "POST",
+            "headers": headers,
+            "body": body,
+            "serialized_body": serialized_body,
+            "signature_payload_preview": f"ApiKey + Request-Time + {serialized_body}",
+            "request_time": headers.get("Request-Time"),
+            "resolved_symbol": symbol,
+            "side_mapping": {
+                "input_side": side,
+                "reduce_only": bool(reduce_only),
+                "mexc_side": body["side"],
+            },
+            "order_type_mapping": {
+                "input_order_type": order_type,
+                "mexc_type": request_type,
+            },
+        }
+
+    def sanitize_signed_order_request(self, signed_request):
+        return {
+            "endpoint": signed_request["endpoint"],
+            "method": signed_request["method"],
+            "sanitized_headers": {key: "<redacted>" for key in (signed_request.get("headers") or {}).keys()},
+            "headers_names_used": sorted((signed_request.get("headers") or {}).keys()),
+            "body": signed_request["body"],
+            "serialized_body": signed_request["serialized_body"],
+            "signature_payload_preview": signed_request["signature_payload_preview"],
+            "request_time": signed_request["request_time"],
+            "resolved_symbol": signed_request["resolved_symbol"],
+            "side_mapping": signed_request["side_mapping"],
+            "order_type_mapping": signed_request["order_type_mapping"],
+        }
+
+    def submit_mexc_signed_order(self, signed_request):
+        response = self.requests.request(
+            signed_request["method"],
+            signed_request["endpoint"],
+            headers=signed_request["headers"],
+            data=signed_request["serialized_body"],
+            timeout=10,
+        )
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {"status_code": response.status_code, "text": response.text}
+        if not response.ok:
+            raise LiveExecutionError(f"live_mexc_order_failed:{response.status_code}:{response.text[:300]}")
+        self.ensure_mexc_response_ok(payload)
+        return payload
+
+    def create_mexc_swap_order(self, client, market, order_type, side, amount, price=None, reduce_only=False, leverage=None):
+        signed_request = self.build_mexc_order_submit_request(client, market, order_type, side, amount, price, reduce_only, leverage)
+        response = self.submit_mexc_signed_order(signed_request)
         order_id = self.order_id(response)
+        symbol = market.get("symbol")
+
         return {
             "id": order_id,
             "symbol": symbol,
@@ -249,7 +314,7 @@ class LiveExecutionService:
             "status": "open",
             "fee": {"cost": 0},
             "raw": response,
-            "request": request,
+            "request": self.sanitize_signed_order_request(signed_request),
         }
 
     def create_futures_order(self, client, market, order_type, side, amount, price=None, reduce_only=False, leverage=None):

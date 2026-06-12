@@ -119,6 +119,21 @@ class MockLiveClient:
     def price_to_precision(self, symbol, price):
         return price
 
+    def sign(self, path, api=None, method="GET", params=None):
+        body = json.dumps(params or {}, separators=(",", ":")) if method == "POST" else None
+        return {
+            "url": f"https://contract.mexc.com/api/v1/private/{path}",
+            "method": method,
+            "body": body,
+            "headers": {
+                "ApiKey": "mock-key",
+                "Request-Time": "123",
+                "Signature": f"signed:{body}",
+                "Content-Type": "application/json",
+                "source": "CCXT",
+            },
+        }
+
     def contractPrivatePostOrderSubmit(self, request):
         if self.fail_contract_open:
             return {"code": 500, "message": "contract open failed"}
@@ -150,6 +165,32 @@ class MockLiveClient:
         }
         self.orders.append(order)
         return order
+
+
+class MockMexcSubmitRequests:
+    def __init__(self, status_code=200, text='{"code":200,"data":"contract-order-1"}'):
+        self.status_code = status_code
+        self.text = text
+        self.calls = []
+
+    class Response:
+        def __init__(self, status_code, text):
+            self.status_code = status_code
+            self.text = text
+            self.ok = 200 <= status_code < 300
+
+        def json(self):
+            return json.loads(self.text)
+
+    def request(self, method, url, headers=None, data=None, timeout=None):
+        self.calls.append({
+            "method": method,
+            "url": url,
+            "headers": headers or {},
+            "data": data,
+            "timeout": timeout,
+        })
+        return self.Response(self.status_code, self.text)
 
 
 def prime_momentum(service, config, exchange, symbol="TON/USDT", old_bid=99, old_ask=99.01):
@@ -1512,8 +1553,9 @@ def test_live_errors_are_stored(client):
 
 
 def test_mexc_open_failed_does_not_create_open_position(client):
-    mock_client = MockLiveClient(fail_contract_open=True, exchange_id="mexc")
-    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client))
+    mock_client = MockLiveClient(exchange_id="mexc")
+    requests_client = MockMexcSubmitRequests(status_code=403, text="Access Denied")
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client, requests_client=requests_client))
     config = make_config(service)
     exchange = seed_live_exchange("Mexc")
     config.exchange = "Mexc"
@@ -1681,7 +1723,8 @@ def test_successful_mocked_mexc_futures_order_opens_trade(client):
             "contractSize": 0.001,
         },
     })
-    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client))
+    requests_client = MockMexcSubmitRequests()
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client, requests_client=requests_client))
     config = make_config(service)
     exchange = seed_live_exchange("Mexc")
     config.exchange = "Mexc"
@@ -1702,9 +1745,12 @@ def test_successful_mocked_mexc_futures_order_opens_trade(client):
     assert result["live_status"] == "open"
     assert trade.closed_at is None
     assert trade.live_exchange_order_id == "contract-order-1"
-    assert mock_client.contract_orders[0]["request"]["symbol"] == "BTC_USDT"
-    assert mock_client.contract_orders[0]["request"]["side"] == 1
-    assert mock_client.contract_orders[0]["request"]["openType"] == 1
+    sent_body = json.loads(requests_client.calls[0]["data"])
+    assert requests_client.calls[0]["url"] == "https://contract.mexc.com/api/v1/private/order/submit"
+    assert sent_body["symbol"] == "BTC_USDT"
+    assert sent_body["side"] == 1
+    assert sent_body["openType"] == 1
+    assert sent_body["type"] == 5
 
 
 def test_mexc_client_uses_swap_options(client):

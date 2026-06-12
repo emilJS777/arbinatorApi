@@ -1757,11 +1757,44 @@ def test_successful_mocked_mexc_futures_order_opens_trade(client):
     sent_body = json.loads(requests_client.calls[1]["data"])
     assert requests_client.calls[0]["url"] == "https://contract.mexc.com/api/v1/contract/detail"
     assert requests_client.calls[0]["params"] == {"symbol": "BTC_USDT"}
-    assert requests_client.calls[1]["url"] == "https://contract.mexc.com/api/v1/private/order/submit"
+    assert requests_client.calls[1]["url"] == "https://api.mexc.com/api/v1/private/order/create"
     assert sent_body["symbol"] == "BTC_USDT"
     assert sent_body["side"] == 1
     assert sent_body["openType"] == 1
-    assert sent_body["type"] == 5
+    assert sent_body["type"] == 6
+    assert "price" not in sent_body
+
+
+def test_mexc_risk_control_code_has_clear_error(client):
+    mock_client = MockLiveClient(exchange_id="mexc", markets={
+        "BTC/USDT:USDT": {
+            "id": "BTC_USDT",
+            "symbol": "BTC/USDT:USDT",
+            "type": "swap",
+            "swap": True,
+            "contract": True,
+            "linear": True,
+            "base": "BTC",
+            "quote": "USDT",
+            "settle": "USDT",
+            "contractSize": 0.001,
+        },
+    })
+    requests_client = MockMexcSubmitRequests(status_code=200, text='{"success":false,"code":6026,"message":"risk control"}')
+    service = LiveExecutionService(client_factory=lambda exchange: mock_client, requests_client=requests_client)
+    config = make_config(OrderBookRecoveryService())
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "BTC/USDT"
+    db.session.commit()
+
+    try:
+        service.open_position(config, "long", 7, 2, 100)
+    except Exception as error:
+        assert str(error) == "mexc_risk_control_verification_required"
+    else:
+        assert False, "MEXC 6026 should be mapped to a clear error"
 
 
 def test_mexc_client_uses_swap_options(client):

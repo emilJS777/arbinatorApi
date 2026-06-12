@@ -220,13 +220,13 @@ def test_mexc_order_submit_drycheck_builds_expected_body_and_does_not_send(clien
     assert len(requests_client.calls) == 1
     assert requests_client.calls[0]["method"] == "GET"
     assert "contract/detail" in requests_client.calls[0]["url"]
-    assert payload["endpoint"] == "https://contract.mexc.com/api/v1/private/order/submit"
+    assert payload["endpoint"] == "https://api.mexc.com/api/v1/private/order/create"
     assert payload["method"] == "POST"
     assert payload["body"]["symbol"] == "BTC_USDT"
-    assert payload["body"]["price"] == 100
+    assert "price" not in payload["body"]
     assert payload["body"]["vol"] == 10
     assert payload["body"]["side"] == 1
-    assert payload["body"]["type"] == 5
+    assert payload["body"]["type"] == 6
     assert payload["body"]["openType"] == 1
     assert payload["body"]["leverage"] == 1
     assert set(payload["available_submit_formats"]) == {
@@ -258,7 +258,7 @@ def test_mexc_order_submit_drycheck_builds_expected_body_and_does_not_send(clien
     assert payload["submit_format_requests"]["json_price_zero"]["body"]["price"] == 0
     assert payload["submit_format_requests"]["json_price_current"]["body"]["price"] == 65000
     assert isinstance(payload["submit_format_requests"]["json_integer_vol"]["body"]["vol"], int)
-    assert payload["submit_format_requests"]["json_integer_vol"]["serialized_body"] == '{"symbol":"BTC_USDT","vol":10,"type":5,"openType":1,"side":1,"leverage":1,"price":100}'
+    assert payload["submit_format_requests"]["json_integer_vol"]["serialized_body"] == '{"symbol":"BTC_USDT","vol":10,"type":6,"openType":1,"side":1,"leverage":1}'
     assert "price" not in payload["submit_format_requests"]["json_type6_price_omitted"]["body"]
     assert payload["submit_format_requests"]["json_type6_price_omitted"]["body"]["type"] == 6
     assert payload["submit_format_requests"]["json_type6_price_zero"]["body"]["type"] == 6
@@ -272,9 +272,8 @@ def test_mexc_order_submit_drycheck_builds_expected_body_and_does_not_send(clien
         "openType": 1,
         "side": 1,
         "leverage": 1,
-        "price": 100,
     }
-    assert payload["submit_format_requests"]["json_type6_integer_vol"]["serialized_body"] == '{"symbol":"BTC_USDT","vol":10,"type":6,"openType":1,"side":1,"leverage":1,"price":100}'
+    assert payload["submit_format_requests"]["json_type6_integer_vol"]["serialized_body"] == '{"symbol":"BTC_USDT","vol":10,"type":6,"openType":1,"side":1,"leverage":1}'
     assert payload["submit_format_requests"]["form_urlencoded_type6"]["content_type"] == "application/x-www-form-urlencoded"
     assert "type=6" in payload["submit_format_requests"]["form_urlencoded_type6"]["serialized_body"]
     assert payload["submit_format_requests"]["json_type6_user_agent"]["body"]["type"] == 6
@@ -303,7 +302,7 @@ def test_mexc_order_submit_drycheck_builds_expected_body_and_does_not_send(clien
     assert payload["volume_details"]["rounded_vol"] == 10
     assert payload["volume_details"]["min_vol"] == 1
     assert payload["volume_details"]["api_allowed"] is True
-    assert payload["order_type_mapping"]["mexc_type"] == 5
+    assert payload["order_type_mapping"]["mexc_type"] == 6
     assert payload["api_format_notes"]["mexc_docs_market_order_type"] == 5
     assert payload["api_format_notes"]["ccxt_mexc_swap_market_order_type"] == 6
     assert payload["api_format_notes"]["latest_ccxt_contract_private_base"] == "https://api.mexc.com/api/v1/private"
@@ -436,7 +435,7 @@ def test_mexc_order_submit_form_urlencoded_signs_exact_sent_body(client):
     assert sent["data"] == payload["real_order_request"]["serialized_body"]
     assert payload["real_order_request"]["signature_payload_preview"].endswith(sent["data"])
     assert "symbol=BTC_USDT" in sent["data"]
-    assert "price=100" in sent["data"]
+    assert "price=100" not in sent["data"]
 
 
 def test_mexc_order_submit_type6_variant_sends_exact_variant(client):
@@ -560,7 +559,7 @@ def test_mexc_order_submit_drycheck_route(client, monkeypatch):
 
     assert response.status_code == 200
     assert payload["dry_run"] is True
-    assert payload["body"]["type"] == 5
+    assert payload["body"]["type"] == 6
 
 
 def test_mexc_order_submit_rejects_below_min_contract_volume(client):

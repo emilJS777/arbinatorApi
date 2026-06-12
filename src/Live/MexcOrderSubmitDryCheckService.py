@@ -354,7 +354,8 @@ class MexcOrderSubmitDryCheckService(Response):
                     "current_market_price": inputs["current_market_price"],
                 },
                 "api_format_notes": {
-                    "endpoint_expected": "https://contract.mexc.com/api/v1/private/order/submit",
+                    "endpoint_expected": "https://api.mexc.com/api/v1/private/order/create",
+                    "old_endpoint": "https://contract.mexc.com/api/v1/private/order/submit",
                     "signature_method": "ApiKey + Request-Time + exact serialized body",
                     "body_serialization": "diagnostics include JSON and form-urlencoded alternatives",
                     "mexc_docs_market_order_type": 5,

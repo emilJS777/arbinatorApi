@@ -273,7 +273,7 @@ class LiveExecutionService:
 
     def mexc_order_type(self, order_type):
         if order_type == "market":
-            return 5
+            return 6
         if order_type == "limit":
             return 1
         return order_type
@@ -283,6 +283,8 @@ class LiveExecutionService:
             return
         code = response.get("code")
         success = response.get("success")
+        if str(code) == "6026":
+            raise LiveExecutionError("mexc_risk_control_verification_required")
         if success is False or (code not in (None, 0, 200, "0", "200")):
             raise LiveExecutionError(f"live_mexc_order_failed:{response}")
 
@@ -300,14 +302,19 @@ class LiveExecutionService:
         }
         if leverage:
             body["leverage"] = int(leverage)
-        if price is not None:
+        if request_type not in (6, "6") and price is not None:
             body["price"] = self.price_to_precision(client, symbol, price)
 
-        signed = client.sign("order/submit", api=["contract", "private"], method="POST", params=body)
+        signed = client.sign("order/create", api=["contract", "private"], method="POST", params=body)
         headers = signed.get("headers") or {}
         serialized_body = signed.get("body")
+        endpoint = signed["url"]
+        old_base = "https://contract.mexc.com/api/v1/private"
+        new_base = "https://api.mexc.com/api/v1/private"
+        if endpoint.startswith(old_base):
+            endpoint = new_base + endpoint[len(old_base):]
         return {
-            "endpoint": signed["url"],
+            "endpoint": endpoint,
             "method": signed.get("method") or "POST",
             "headers": headers,
             "body": body,
@@ -324,6 +331,7 @@ class LiveExecutionService:
                 "input_order_type": order_type,
                 "mexc_type": request_type,
             },
+            "endpoint_path": "order/create",
             "contract_detail": detail,
             "volume_details": volume_details,
         }
@@ -357,9 +365,9 @@ class LiveExecutionService:
             payload = response.json()
         except Exception:
             payload = {"status_code": response.status_code, "text": response.text}
+        self.ensure_mexc_response_ok(payload)
         if not response.ok:
             raise LiveExecutionError(f"live_mexc_order_failed:{response.status_code}:{response.text[:300]}")
-        self.ensure_mexc_response_ok(payload)
         return payload
 
     def create_mexc_swap_order(self, client, market, order_type, side, amount, price=None, reduce_only=False, leverage=None):

@@ -8,6 +8,7 @@ import logging
 import time
 
 from flask import jsonify, make_response, send_file
+from sqlalchemy import or_
 
 from src import db
 from src.Arbitrage.OrderBookSnapshotStore import OrderBookSnapshotStore
@@ -19,6 +20,7 @@ from src.OrderBookRecovery.OrderBookRecoveryModel import (
     StrategyRunTrade,
 )
 from src.OrderBookRecovery.OrderBookNormalizer import OrderBookNormalizer
+from src.OrderBookRecovery.LiveExecutionService import LiveExecutionService, LiveExecutionError
 from src.OrderBookRecovery.SignalFeedbackService import SignalFeedbackService
 from src.TradingPair.TradingPairModel import TradingPair
 from src.Socket.EventPublisher import EventPublisher
@@ -36,10 +38,13 @@ class OrderBookRecoveryService(Response):
     _last_hook_snapshot = None
     _last_matching_hooks = {}
     _last_mismatch_hooks = {}
+    _pending_entries = {}
+    _last_confirmation_results = {}
 
-    def __init__(self, publisher=None):
+    def __init__(self, publisher=None, live_execution_service=None):
         self.publisher = publisher or EventPublisher()
         self.feedback_service = SignalFeedbackService()
+        self.live_execution_service = live_execution_service or LiveExecutionService()
 
     def get_or_create_config(self):
         config = OrderBookPatternStrategyConfig.query.order_by(OrderBookPatternStrategyConfig.id.asc()).first()
@@ -145,6 +150,22 @@ class OrderBookRecoveryService(Response):
             "imbalance_anomaly_min",
             "imbalance_anomaly_max",
             "exclude_anomalous_imbalance",
+            "entry_mode",
+            "confirmation_delay_seconds",
+            "confirmation_max_wait_seconds",
+            "confirmation_require_same_direction",
+            "confirmation_require_momentum_improvement",
+            "confirmation_min_momentum_delta",
+            "confirmation_require_consensus_still_valid",
+            "execution_mode",
+            "live_enabled_confirmation",
+            "live_kill_switch",
+            "live_max_margin_usdt",
+            "live_max_daily_loss_usdt",
+            "live_max_total_loss_usdt",
+            "live_order_type",
+            "live_reduce_only_close",
+            "live_open_failed_cooldown_seconds",
             "cooldown_after_max_recovery_seconds",
             "feedback_enabled",
             "feedback_lookback_trades",
@@ -158,6 +179,12 @@ class OrderBookRecoveryService(Response):
         for key in allowed:
             if key in overrides:
                 setattr(config, key, overrides[key])
+        if config.entry_mode not in {"instant", "two_step_confirmation"}:
+            config.entry_mode = "instant"
+        if config.execution_mode not in {"paper", "live"}:
+            config.execution_mode = "paper"
+        if config.live_order_type not in {"market", "limit"}:
+            config.live_order_type = "market"
         config.paper_mode_only = True
 
     def update_config(self, body: dict):
@@ -192,6 +219,10 @@ class OrderBookRecoveryService(Response):
 
     def start_paper(self):
         config = self.get_or_create_config()
+        if config.execution_mode == "live":
+            reason = self.live_start_rejection(config)
+            if reason:
+                return self.response(False, {"msg": reason}, 400)
         config.enabled = True
         config.paper_mode_only = True
         state = self.get_or_create_state(config)
@@ -211,6 +242,44 @@ class OrderBookRecoveryService(Response):
         payload = self.state_payload(config, state)
         self.publisher.publish("orderbook_recovery.started", payload)
         return self.response_ok(payload)
+
+    def live_start_rejection(self, config):
+        state = self.get_or_create_state(config)
+        reason = self.live_execution_service.validate_enabled(config, state.current_margin or config.base_margin_usdt)
+        if reason:
+            return reason
+        snapshot = self.snapshot_for(config.exchange, config.symbol)
+        if not snapshot:
+            return "live_requires_fresh_snapshot"
+        features, error = self.features(config, snapshot)
+        if not features:
+            return error or "live_requires_valid_snapshot"
+        row = self.exchange_feature(config, snapshot, datetime.utcnow())
+        if not row.get("valid"):
+            return row.get("reject_reason") or "live_requires_fresh_snapshot"
+        if abs(self.live_daily_loss(config, datetime.utcnow())) >= float(config.live_max_daily_loss_usdt):
+            return "live_daily_loss_exceeded"
+        if abs(self.live_total_loss(config)) >= float(config.live_max_total_loss_usdt):
+            return "live_total_loss_exceeded"
+        if self.open_live_trade(config):
+            return "live_position_already_open"
+        try:
+            client = self.live_execution_service.client(config)
+            market = self.live_execution_service.market(client, config.symbol)
+            logger.info("OrderBookRecovery live startup market resolved: %s", self.live_execution_service.market_info(market, configured_symbol=config.symbol))
+        except Exception as error:
+            return str(error)
+        return None
+
+    def live_market_debug(self, config):
+        if config.execution_mode != "live":
+            return self.live_execution_service.market_info(configured_symbol=config.symbol)
+        try:
+            client = self.live_execution_service.client(config)
+            market = self.live_execution_service.market(client, config.symbol)
+            return self.live_execution_service.market_info(market, configured_symbol=config.symbol)
+        except Exception as error:
+            return self.live_execution_service.market_info(error=str(error), configured_symbol=config.symbol)
 
     def stop(self, reason="manual_stop"):
         config = self.get_or_create_config()
@@ -347,6 +416,8 @@ class OrderBookRecoveryService(Response):
         if reason != "manual_close":
             reason = "manual_close"
         payload = self.close_trade(trade, exit_price, pnl, reason, state, config, current_time)
+        if not payload:
+            return self.response(False, {"msg": "live_close_failed", "trade": self.trade_to_dict(trade)}, 400)
         self.store_last_evaluation(
             config,
             features,
@@ -446,6 +517,8 @@ class OrderBookRecoveryService(Response):
             "median_imbalance", "raw_average_imbalance", "anomalous_exchanges_count",
             "excluded_anomalous_imbalance_exchanges",
             "configured_exchange_imbalance", "configured_exchange_spread", "configured_exchange_momentum", "entry_reason",
+            "entry_mode", "confirmation_delay_actual_seconds", "first_signal_snapshot_json", "confirmation_snapshot_json",
+            "execution_mode", "live_status", "live_exchange_order_id", "live_close_order_id", "live_entry_fee", "live_exit_fee", "live_error",
             "feedback_enabled", "long_recent_win_rate", "short_recent_win_rate", "long_loss_streak", "short_loss_streak",
             "adaptive_min_consensus_ratio", "adaptive_min_valid_exchanges", "blocked_side", "feedback_reject_reason",
             "exchange", "symbol", "base_margin_usdt", "leverage_config", "tp_percent_of_margin", "sl_percent_of_margin",
@@ -495,6 +568,17 @@ class OrderBookRecoveryService(Response):
             "configured_exchange_spread": trade.configured_exchange_spread or trade.signal_configured_exchange_spread,
             "configured_exchange_momentum": trade.configured_exchange_momentum or trade.signal_configured_exchange_momentum,
             "entry_reason": trade.entry_reason or trade.reason_open,
+            "entry_mode": trade.entry_mode or "instant",
+            "confirmation_delay_actual_seconds": trade.confirmation_delay_actual_seconds,
+            "first_signal_snapshot_json": trade.first_signal_snapshot_json,
+            "confirmation_snapshot_json": trade.confirmation_snapshot_json,
+            "execution_mode": trade.execution_mode or "paper",
+            "live_status": trade.live_status,
+            "live_exchange_order_id": trade.live_exchange_order_id,
+            "live_close_order_id": trade.live_close_order_id,
+            "live_entry_fee": trade.live_entry_fee,
+            "live_exit_fee": trade.live_exit_fee,
+            "live_error": trade.live_error,
             "feedback_enabled": feedback.get("feedback_enabled"),
             "long_recent_win_rate": feedback.get("long_recent_win_rate"),
             "short_recent_win_rate": feedback.get("short_recent_win_rate"),
@@ -641,6 +725,8 @@ class OrderBookRecoveryService(Response):
             consensus["reject_reason"] = feedback["feedback_reject_reason"]
         consensus["feedback"] = feedback
         reject_reason = consensus.get("reject_reason") or (self.risk_rejection(config, state, features, current_time) if not signal else None)
+        if config.entry_mode == "two_step_confirmation":
+            return self.handle_two_step_entry(config, state, features, long_signal, short_signal, signal, consensus, reject_reason, current_time)
         self.store_last_evaluation(config, features, long_signal, short_signal, signal or "none", reject_reason, current_time, consensus)
         logger.info(
             "OrderBookRecovery evaluation result: exchange=%s symbol=%s decision=%s imbalance=%s spread=%s momentum=%s",
@@ -728,6 +814,152 @@ class OrderBookRecoveryService(Response):
             "consensus": consensus or {},
         }
 
+    def pending_key(self, config):
+        return self.debug_key(config)
+
+    def pending_entry_for(self, config):
+        return self.__class__._pending_entries.get(self.pending_key(config))
+
+    def clear_pending_entry(self, config, status=None, reject_reason=None, current_time=None):
+        pending = self.__class__._pending_entries.pop(self.pending_key(config), None)
+        result = {
+            "status": status or "cleared",
+            "reject_reason": reject_reason,
+            "at": current_time or datetime.utcnow(),
+        }
+        if pending:
+            result.update({
+                "side": pending.get("side"),
+                "created_at": pending.get("created_at"),
+                "expires_at": pending.get("expires_at"),
+            })
+        self.__class__._last_confirmation_results[self.pending_key(config)] = result
+        return pending
+
+    def consensus_summary_snapshot(self, features, consensus, current_time):
+        return {
+            "timestamp": current_time,
+            "entry_price": features.get("mid_price"),
+            "configured_exchange_imbalance": consensus.get("configured_exchange_imbalance"),
+            "configured_exchange_spread": consensus.get("configured_exchange_spread"),
+            "configured_exchange_momentum": consensus.get("configured_exchange_momentum"),
+            "consensus_direction": consensus.get("consensus_direction"),
+            "median_imbalance": consensus.get("median_imbalance"),
+            "average_momentum": consensus.get("average_momentum"),
+            "valid_exchanges_count": consensus.get("valid_exchanges_count"),
+            "confirming_long_count": consensus.get("confirming_long_count"),
+            "confirming_short_count": consensus.get("confirming_short_count"),
+            "consensus_ratio_long": consensus.get("consensus_ratio_long"),
+            "consensus_ratio_short": consensus.get("consensus_ratio_short"),
+            "configured_exchange_valid": consensus.get("configured_exchange_valid"),
+            "reject_reason": consensus.get("reject_reason"),
+        }
+
+    def create_pending_entry(self, config, features, side, consensus, current_time):
+        confirming_count = consensus.get("confirming_long_count") if side == "long" else consensus.get("confirming_short_count")
+        pending = {
+            "side": side,
+            "created_at": current_time,
+            "expires_at": current_time + timedelta(seconds=float(config.confirmation_max_wait_seconds)),
+            "status": "pending",
+            "first_snapshot": self.consensus_summary_snapshot(features, consensus, current_time),
+            "first_consensus_direction": consensus.get("consensus_direction"),
+            "first_median_imbalance": consensus.get("median_imbalance"),
+            "first_average_momentum": consensus.get("average_momentum") or 0,
+            "first_valid_exchanges_count": consensus.get("valid_exchanges_count"),
+            "first_confirming_count": confirming_count,
+            "first_entry_price": features.get("mid_price"),
+            "reason": consensus.get("reject_reason") or "signal_detected",
+        }
+        self.__class__._pending_entries[self.pending_key(config)] = pending
+        self.__class__._last_confirmation_results[self.pending_key(config)] = {
+            "status": "pending",
+            "reject_reason": None,
+            "at": current_time,
+        }
+        return pending
+
+    def confirmation_reject_reason(self, config, pending, signal, consensus):
+        side = pending.get("side")
+        if config.confirmation_require_consensus_still_valid and not consensus.get("configured_exchange_valid"):
+            return "configured_exchange_invalid"
+        if config.confirmation_require_same_direction and signal != side:
+            return "direction_changed"
+        if consensus.get("consensus_direction") != side:
+            return "direction_changed"
+        if (consensus.get("valid_exchanges_count") or 0) < int(config.min_valid_exchanges):
+            return "not_enough_valid_exchanges"
+        if side == "long":
+            if (consensus.get("confirming_long_count") or 0) < int(config.min_confirming_exchanges):
+                return "not_enough_confirming_exchanges"
+            if (consensus.get("consensus_ratio_long") or 0) < float(config.min_consensus_ratio):
+                return "consensus_ratio_too_low"
+            if (consensus.get("average_momentum") or 0) <= 0:
+                return "momentum_not_positive"
+            if config.confirmation_require_momentum_improvement:
+                required = float(pending.get("first_average_momentum") or 0) + float(config.confirmation_min_momentum_delta)
+                if (consensus.get("average_momentum") or 0) < required:
+                    return "momentum_not_improved"
+        else:
+            if (consensus.get("confirming_short_count") or 0) < int(config.min_confirming_exchanges):
+                return "not_enough_confirming_exchanges"
+            if (consensus.get("consensus_ratio_short") or 0) < float(config.min_consensus_ratio):
+                return "consensus_ratio_too_low"
+            if (consensus.get("average_momentum") or 0) >= 0:
+                return "momentum_not_negative"
+            if config.confirmation_require_momentum_improvement:
+                required = abs(float(pending.get("first_average_momentum") or 0)) + float(config.confirmation_min_momentum_delta)
+                if abs(consensus.get("average_momentum") or 0) < required:
+                    return "momentum_not_improved"
+        if self.open_positions_count(config) >= config.max_open_positions:
+            return "max_open_positions_reached"
+        return None
+
+    def handle_two_step_entry(self, config, state, features, long_signal, short_signal, signal, consensus, reject_reason, current_time):
+        pending = self.pending_entry_for(config)
+        if pending:
+            if current_time > pending["expires_at"]:
+                self.clear_pending_entry(config, "expired", "confirmation_expired", current_time)
+                consensus["reject_reason"] = "confirmation_expired"
+                self.store_last_evaluation(config, features, long_signal, short_signal, "none", "confirmation_expired", current_time, consensus)
+                return None
+            ready_at = pending["created_at"] + timedelta(seconds=float(config.confirmation_delay_seconds))
+            if current_time < ready_at:
+                consensus["reject_reason"] = "confirmation_waiting"
+                self.store_last_evaluation(config, features, long_signal, short_signal, "none", "confirmation_waiting", current_time, consensus)
+                return None
+            reason = self.confirmation_reject_reason(config, pending, signal, consensus)
+            if reason:
+                reject = f"confirmation_failed_{reason}"
+                self.clear_pending_entry(config, "cancelled", reject, current_time)
+                consensus["reject_reason"] = reject
+                self.store_last_evaluation(config, features, long_signal, short_signal, "none", reject, current_time, consensus)
+                return None
+            confirmation_snapshot = self.consensus_summary_snapshot(features, consensus, current_time)
+            actual_delay = (current_time - pending["created_at"]).total_seconds()
+            context = {
+                "entry_mode": "two_step_confirmation",
+                "first_signal_snapshot": pending["first_snapshot"],
+                "confirmation_snapshot": confirmation_snapshot,
+                "confirmation_delay_actual_seconds": actual_delay,
+                "confirmation_result": "confirmed",
+                "first_signal_time": pending["created_at"],
+                "confirmation_time": current_time,
+            }
+            self.clear_pending_entry(config, "confirmed", None, current_time)
+            consensus["reject_reason"] = None
+            self.store_last_evaluation(config, features, long_signal, short_signal, pending["side"], None, current_time, consensus)
+            return self.open_position(config, state, features, pending["side"], current_time, consensus, context)
+
+        if signal:
+            pending = self.create_pending_entry(config, features, signal, consensus, current_time)
+            consensus["reject_reason"] = "confirmation_pending"
+            self.store_last_evaluation(config, features, long_signal, short_signal, "none", "confirmation_pending", current_time, consensus)
+            return None
+
+        self.store_last_evaluation(config, features, long_signal, short_signal, "none", reject_reason, current_time, consensus)
+        return None
+
     def last_evaluation_for(self, config):
         return self.__class__._last_evaluations.get(self.debug_key(config))
 
@@ -810,6 +1042,15 @@ class OrderBookRecoveryService(Response):
         }
         consensus = (self.last_evaluation_for(config) or {}).get("consensus") or self.consensus_snapshot(config)
         feedback = consensus.get("feedback") or self.feedback_snapshot(config, None, consensus, datetime.utcnow())
+        pending = self.pending_entry_for(config) or {}
+        confirmation = self.__class__._last_confirmation_results.get(self.pending_key(config)) or {}
+        live_market = self.live_market_debug(config)
+        margin_limit = self.live_execution_service.margin_limit_debug(
+            config,
+            state.current_margin or config.base_margin_usdt,
+            config.leverage,
+        )
+        now = datetime.utcnow()
         return {
             "config": self.config_to_dict(config),
             "state": self.state_to_dict(state),
@@ -831,6 +1072,26 @@ class OrderBookRecoveryService(Response):
             "average_momentum": consensus.get("average_momentum"),
             "consensus_direction": consensus.get("consensus_direction") or "none",
             "entry_blocked_reason": consensus.get("reject_reason") or (self.last_evaluation_for(config) or {}).get("reject_reason"),
+            "entry_mode": config.entry_mode,
+            "resolved_live_symbol": live_market.get("resolved_live_symbol"),
+            "live_market_type": live_market.get("live_market_type"),
+            "live_market_valid": live_market.get("live_market_valid"),
+            "live_market_error": live_market.get("live_market_error"),
+            "live_market": live_market,
+            **margin_limit,
+            "pending_entry_exists": bool(pending),
+            "pending_entry_side": pending.get("side"),
+            "pending_entry_created_at": pending.get("created_at"),
+            "pending_entry_expires_at": pending.get("expires_at"),
+            "pending_entry_age_seconds": ((now - pending["created_at"]).total_seconds() if pending.get("created_at") else None),
+            "pending_entry_expires_in_seconds": ((pending["expires_at"] - now).total_seconds() if pending.get("expires_at") else None),
+            "pending_entry_first_momentum": pending.get("first_average_momentum"),
+            "pending_entry_current_momentum": consensus.get("average_momentum"),
+            "pending_entry_first_consensus": pending.get("first_consensus_direction"),
+            "pending_entry_current_consensus": consensus.get("consensus_direction"),
+            "pending_entry_status": pending.get("status") or confirmation.get("status"),
+            "last_confirmation_result": confirmation.get("status"),
+            "last_confirmation_reject_reason": confirmation.get("reject_reason"),
             "feedback_enabled": feedback.get("feedback_enabled"),
             "long_recent_win_rate": feedback.get("long_recent_win_rate"),
             "short_recent_win_rate": feedback.get("short_recent_win_rate"),
@@ -1109,6 +1370,21 @@ class OrderBookRecoveryService(Response):
             return "max_open_positions_reached"
         if state.current_margin > self.available_equity(config):
             return "current_margin_exceeds_available_paper_equity"
+        if config.execution_mode == "live":
+            live_reason = self.live_execution_service.validate_enabled(config, state.current_margin or config.base_margin_usdt)
+            if live_reason:
+                return live_reason
+            if abs(self.live_daily_loss(config, current_time)) >= float(config.live_max_daily_loss_usdt):
+                return "live_daily_loss_exceeded"
+            if abs(self.live_total_loss(config)) >= float(config.live_max_total_loss_usdt):
+                return "live_total_loss_exceeded"
+            if self.open_live_trade(config):
+                return "live_position_already_open"
+            failed = self.last_live_open_failed(config)
+            if failed:
+                retry_at = failed.opened_at + timedelta(seconds=int(config.live_open_failed_cooldown_seconds))
+                if current_time < retry_at:
+                    return "live_open_failed_cooldown"
         if abs(self.daily_loss(config, current_time)) >= config.max_daily_loss_usdt:
             return "daily_loss_exceeded"
         if abs(self.total_loss(config)) >= config.max_total_loss_usdt:
@@ -1157,6 +1433,11 @@ class OrderBookRecoveryService(Response):
                 "approved": True,
                 "reason": None,
             },
+            "entry_mode": consensus.get("entry_mode") or config.entry_mode,
+            "first_signal_snapshot": consensus.get("first_signal_snapshot"),
+            "confirmation_snapshot": consensus.get("confirmation_snapshot"),
+            "confirmation_delay_actual_seconds": consensus.get("confirmation_delay_actual_seconds"),
+            "confirmation_result": consensus.get("confirmation_result"),
             "consensus_decision": {
                 "direction": consensus.get("consensus_direction"),
                 "valid_exchanges_count": consensus.get("valid_exchanges_count"),
@@ -1186,13 +1467,40 @@ class OrderBookRecoveryService(Response):
             },
         }
 
-    def open_position(self, config, state, features, side, current_time, consensus=None):
+    def open_position(self, config, state, features, side, current_time, consensus=None, entry_context=None):
         consensus = consensus or {}
+        entry_context = entry_context or {}
+        consensus.update({
+            "entry_mode": entry_context.get("entry_mode") or config.entry_mode or "instant",
+            "first_signal_snapshot": entry_context.get("first_signal_snapshot"),
+            "confirmation_snapshot": entry_context.get("confirmation_snapshot"),
+            "confirmation_delay_actual_seconds": entry_context.get("confirmation_delay_actual_seconds"),
+            "confirmation_result": entry_context.get("confirmation_result") or ("confirmed" if entry_context else None),
+        })
         margin = float(state.current_margin or config.base_margin_usdt)
         notional = margin * float(config.leverage)
         entry_price = features["mid_price"]
         amount = notional / entry_price if entry_price else 0
+        live_result = None
+        live_error = None
+        if config.execution_mode == "live":
+            try:
+                live_result = self.live_execution_service.open_position(config, side, margin, config.leverage, entry_price)
+                entry_price = live_result["average_fill_price"]
+                amount = live_result["filled_amount"]
+                notional = entry_price * amount
+            except Exception as error:
+                live_error = str(error)
         entry_reason = f"side={side}, consensus={consensus.get('consensus_direction')}, imbalance={features['imbalance']:.4f}, momentum={features['short_momentum']:.8f}, spread={features['spread_percent']:.4f}"
+        if consensus.get("entry_mode") == "two_step_confirmation":
+            entry_reason = (
+                f"{entry_reason}, entry_mode=two_step_confirmation, "
+                f"first_signal_time={entry_context.get('first_signal_time')}, confirmation_time={entry_context.get('confirmation_time')}, "
+                f"first_momentum={(entry_context.get('first_signal_snapshot') or {}).get('average_momentum')}, "
+                f"confirmed_momentum={(entry_context.get('confirmation_snapshot') or {}).get('average_momentum')}, "
+                f"first_consensus={(entry_context.get('first_signal_snapshot') or {}).get('consensus_direction')}, "
+                f"confirmed_consensus={(entry_context.get('confirmation_snapshot') or {}).get('consensus_direction')}"
+            )
         per_exchange_features = consensus.get("per_exchange_features") or []
         decision_snapshot = self.decision_snapshot(config, state, features, side, current_time, consensus, margin, notional, entry_price)
         trade = StrategyRunTrade(
@@ -1210,6 +1518,8 @@ class OrderBookRecoveryService(Response):
             recovery_step=state.current_step,
             reason_open=entry_reason,
             opened_at=current_time,
+            closed_at=current_time if live_error else None,
+            result="rejected" if live_error else None,
             signal_consensus_direction=consensus.get("consensus_direction"),
             signal_valid_exchanges_count=consensus.get("valid_exchanges_count"),
             signal_confirming_long_count=consensus.get("confirming_long_count"),
@@ -1245,11 +1555,27 @@ class OrderBookRecoveryService(Response):
             configured_exchange_spread=consensus.get("configured_exchange_spread"),
             configured_exchange_momentum=consensus.get("configured_exchange_momentum"),
             entry_reason=entry_reason,
+            entry_mode=consensus.get("entry_mode") or "instant",
+            first_signal_snapshot_json=json.dumps(consensus.get("first_signal_snapshot"), default=str) if consensus.get("first_signal_snapshot") else None,
+            confirmation_snapshot_json=json.dumps(consensus.get("confirmation_snapshot"), default=str) if consensus.get("confirmation_snapshot") else None,
+            confirmation_delay_actual_seconds=consensus.get("confirmation_delay_actual_seconds"),
+            confirmation_result=consensus.get("confirmation_result"),
+            execution_mode=config.execution_mode or "paper",
+            live_exchange_order_id=live_result.get("order_id") if live_result else None,
+            live_entry_price=live_result.get("average_fill_price") if live_result else None,
+            live_filled_amount=live_result.get("filled_amount") if live_result else None,
+            live_entry_fee=live_result.get("fee") if live_result else None,
+            live_status=("open" if live_result else ("open_failed" if live_error else None)),
+            live_error=live_error or (live_result.get("warning") if live_result else None),
+            live_raw_open_response_json=self.live_execution_service.raw_json(live_result.get("raw_response")) if live_result else None,
         )
         state.last_opened_at = current_time
         db.session.add(trade)
         db.session.commit()
         payload = self.trade_to_dict(trade)
+        if live_error:
+            logger.warning("OrderBookRecovery live open failed: trade_id=%s error=%s", trade.id, live_error)
+            return payload
         logger.info("OrderBookRecovery position opened: trade_id=%s side=%s margin=%s entry=%s", trade.id, side, margin, entry_price)
         self.publisher.publish("orderbook_recovery.position_opened", payload)
         return payload
@@ -1267,6 +1593,26 @@ class OrderBookRecoveryService(Response):
         return None
 
     def close_trade(self, trade, exit_price, pnl, reason, state, config, current_time):
+        if trade.execution_mode == "live":
+            try:
+                live_result = self.live_execution_service.close_position(config, trade, exit_price)
+                exit_price = live_result["average_fill_price"]
+                entry_price = trade.live_entry_price or trade.entry_price
+                gross_pnl = self.calculate_pnl(trade.side, entry_price, exit_price, trade.notional)
+                pnl = gross_pnl - float(trade.live_entry_fee or 0) - float(live_result.get("fee") or 0)
+                trade.live_close_order_id = live_result.get("order_id")
+                trade.live_exit_price = exit_price
+                trade.live_exit_fee = live_result.get("fee")
+                trade.live_status = "closed"
+                trade.live_raw_close_response_json = self.live_execution_service.raw_json(live_result.get("raw_response"))
+                if live_result.get("warning"):
+                    trade.live_error = live_result["warning"]
+            except Exception as error:
+                trade.live_status = "close_failed"
+                trade.live_error = str(error)
+                db.session.commit()
+                logger.warning("OrderBookRecovery live close failed: trade_id=%s error=%s", trade.id, error)
+                return None
         trade.exit_price = exit_price
         trade.pnl = pnl
         trade.result = "win" if pnl > 0 else "loss"
@@ -1323,10 +1669,33 @@ class OrderBookRecoveryService(Response):
         return payload
 
     def open_trade(self, config):
-        return StrategyRunTrade.query.filter_by(strategy_config_id=config.id, closed_at=None).order_by(StrategyRunTrade.id.desc()).first()
+        return StrategyRunTrade.query.filter(
+            StrategyRunTrade.strategy_config_id == config.id,
+            StrategyRunTrade.closed_at.is_(None),
+            or_(StrategyRunTrade.live_status.is_(None), StrategyRunTrade.live_status != "open_failed"),
+        ).order_by(StrategyRunTrade.id.desc()).first()
+
+    def open_live_trade(self, config):
+        return StrategyRunTrade.query.filter(
+            StrategyRunTrade.strategy_config_id == config.id,
+            StrategyRunTrade.closed_at.is_(None),
+            StrategyRunTrade.execution_mode == "live",
+            or_(StrategyRunTrade.live_status.is_(None), StrategyRunTrade.live_status != "open_failed"),
+        ).order_by(StrategyRunTrade.id.desc()).first()
+
+    def last_live_open_failed(self, config):
+        return StrategyRunTrade.query.filter_by(
+            strategy_config_id=config.id,
+            execution_mode="live",
+            live_status="open_failed",
+        ).order_by(StrategyRunTrade.opened_at.desc()).first()
 
     def open_positions_count(self, config):
-        return StrategyRunTrade.query.filter_by(strategy_config_id=config.id, closed_at=None).count()
+        return StrategyRunTrade.query.filter(
+            StrategyRunTrade.strategy_config_id == config.id,
+            StrategyRunTrade.closed_at.is_(None),
+            or_(StrategyRunTrade.live_status.is_(None), StrategyRunTrade.live_status != "open_failed"),
+        ).count()
 
     def active_run(self, config):
         return StrategyRun.query.filter_by(strategy_config_id=config.id, status="running").order_by(StrategyRun.id.desc()).first()
@@ -1341,31 +1710,62 @@ class OrderBookRecoveryService(Response):
         current_time = current_time or datetime.utcnow()
         start = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
         losses = [
-            trade.pnl for trade in self.closed_trades_query(config)
+            trade.pnl for trade in self.metrics_trades_query(config)
             .filter(StrategyRunTrade.closed_at >= start, StrategyRunTrade.pnl < 0)
             .all()
         ]
         return sum(losses)
 
     def total_loss(self, config):
-        losses = [trade.pnl for trade in self.closed_trades_query(config).filter(StrategyRunTrade.pnl < 0).all()]
+        losses = [trade.pnl for trade in self.metrics_trades_query(config).filter(StrategyRunTrade.pnl < 0).all()]
+        return sum(losses)
+
+    def live_daily_loss(self, config, current_time=None):
+        current_time = current_time or datetime.utcnow()
+        start = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        losses = [
+            trade.pnl for trade in self.metrics_trades_query(config)
+            .filter(StrategyRunTrade.execution_mode == "live", StrategyRunTrade.closed_at >= start, StrategyRunTrade.pnl < 0)
+            .all()
+        ]
+        return sum(losses)
+
+    def live_total_loss(self, config):
+        losses = [
+            trade.pnl for trade in self.metrics_trades_query(config)
+            .filter(StrategyRunTrade.execution_mode == "live", StrategyRunTrade.pnl < 0)
+            .all()
+        ]
         return sum(losses)
 
     def available_equity(self, config):
-        realized = sum(trade.pnl for trade in self.closed_trades_query(config).all())
+        realized = sum(trade.pnl for trade in self.metrics_trades_query(config).all())
         return float(config.paper_equity_usdt) + realized
 
     def metrics(self):
         config = self.get_or_create_config()
-        trades = self.closed_trades_query(config).filter_by(is_archived=False).all()
-        archived_trades = self.closed_trades_query(config).filter_by(is_archived=True).all()
+        trades = self.metrics_trades_query(config).filter_by(is_archived=False).all()
+        archived_trades = self.metrics_trades_query(config).filter_by(is_archived=True).all()
         return self.calculate_metrics(trades, config.paper_equity_usdt, self.open_trade(config), archived_trades)
 
     def metrics_for_run(self, run):
         config = db.session.get(OrderBookPatternStrategyConfig, run.strategy_config_id)
-        trades = StrategyRunTrade.query.filter_by(strategy_run_id=run.id, is_archived=False).all()
-        archived_trades = StrategyRunTrade.query.filter_by(strategy_run_id=run.id, is_archived=True).all()
-        open_trade = StrategyRunTrade.query.filter_by(strategy_run_id=run.id, closed_at=None).first()
+        live_not_failed = or_(StrategyRunTrade.live_status.is_(None), StrategyRunTrade.live_status != "open_failed")
+        trades = StrategyRunTrade.query.filter(
+            StrategyRunTrade.strategy_run_id == run.id,
+            StrategyRunTrade.is_archived.is_(False),
+            live_not_failed,
+        ).all()
+        archived_trades = StrategyRunTrade.query.filter(
+            StrategyRunTrade.strategy_run_id == run.id,
+            StrategyRunTrade.is_archived.is_(True),
+            live_not_failed,
+        ).all()
+        open_trade = StrategyRunTrade.query.filter(
+            StrategyRunTrade.strategy_run_id == run.id,
+            StrategyRunTrade.closed_at.is_(None),
+            live_not_failed,
+        ).first()
         return self.calculate_metrics(trades, config.paper_equity_usdt if config else 10000, open_trade, archived_trades)
 
     def calculate_metrics(self, trades, initial_equity, open_trade=None, archived_trades=None):
@@ -1424,6 +1824,11 @@ class OrderBookRecoveryService(Response):
         return consecutive_wins, consecutive_losses
 
     def state_payload(self, config, state):
+        margin_limit = self.live_execution_service.margin_limit_debug(
+            config,
+            state.current_margin or config.base_margin_usdt,
+            config.leverage,
+        )
         return {
             "config": self.config_to_dict(config),
             "recovery_state": self.state_to_dict(state),
@@ -1438,13 +1843,19 @@ class OrderBookRecoveryService(Response):
             "latest_snapshot": self.latest_snapshot_for(config),
             "last_order_book_snapshot_time": (self.latest_snapshot_for(config) or {}).get("updated_at"),
             "reason_if_not_trading": self.reason_if_not_trading(config, state),
+            "live_market": self.live_market_debug(config),
+            **margin_limit,
             "metrics": self.metrics_without_state_query(config),
         }
 
     def metrics_without_state_query(self, config):
-        trades = self.closed_trades_query(config).filter_by(is_archived=False).all()
-        archived_trades = self.closed_trades_query(config).filter_by(is_archived=True).all()
+        trades = self.metrics_trades_query(config).filter_by(is_archived=False).all()
+        archived_trades = self.metrics_trades_query(config).filter_by(is_archived=True).all()
         return self.calculate_metrics(trades, config.paper_equity_usdt, self.open_trade(config), archived_trades)
+
+    def metrics_trades_query(self, config=None):
+        query = self.closed_trades_query(config).filter(or_(StrategyRunTrade.live_status.is_(None), StrategyRunTrade.live_status != "open_failed"))
+        return query
 
     def config_to_dict(self, config):
         return {
@@ -1480,6 +1891,22 @@ class OrderBookRecoveryService(Response):
             "imbalance_anomaly_min": config.imbalance_anomaly_min,
             "imbalance_anomaly_max": config.imbalance_anomaly_max,
             "exclude_anomalous_imbalance": config.exclude_anomalous_imbalance,
+            "entry_mode": config.entry_mode,
+            "confirmation_delay_seconds": config.confirmation_delay_seconds,
+            "confirmation_max_wait_seconds": config.confirmation_max_wait_seconds,
+            "confirmation_require_same_direction": config.confirmation_require_same_direction,
+            "confirmation_require_momentum_improvement": config.confirmation_require_momentum_improvement,
+            "confirmation_min_momentum_delta": config.confirmation_min_momentum_delta,
+            "confirmation_require_consensus_still_valid": config.confirmation_require_consensus_still_valid,
+            "execution_mode": config.execution_mode,
+            "live_enabled_confirmation": config.live_enabled_confirmation,
+            "live_kill_switch": config.live_kill_switch,
+            "live_max_margin_usdt": config.live_max_margin_usdt,
+            "live_max_daily_loss_usdt": config.live_max_daily_loss_usdt,
+            "live_max_total_loss_usdt": config.live_max_total_loss_usdt,
+            "live_order_type": config.live_order_type,
+            "live_reduce_only_close": config.live_reduce_only_close,
+            "live_open_failed_cooldown_seconds": config.live_open_failed_cooldown_seconds,
             "cooldown_after_max_recovery_seconds": config.cooldown_after_max_recovery_seconds,
             "feedback_enabled": config.feedback_enabled,
             "feedback_lookback_trades": config.feedback_lookback_trades,
@@ -1570,6 +1997,23 @@ class OrderBookRecoveryService(Response):
             "configured_exchange_spread": trade.configured_exchange_spread,
             "configured_exchange_momentum": trade.configured_exchange_momentum,
             "entry_reason": trade.entry_reason,
+            "entry_mode": trade.entry_mode,
+            "first_signal_snapshot_json": trade.first_signal_snapshot_json,
+            "confirmation_snapshot_json": trade.confirmation_snapshot_json,
+            "confirmation_delay_actual_seconds": trade.confirmation_delay_actual_seconds,
+            "confirmation_result": trade.confirmation_result,
+            "execution_mode": trade.execution_mode,
+            "live_exchange_order_id": trade.live_exchange_order_id,
+            "live_close_order_id": trade.live_close_order_id,
+            "live_entry_price": trade.live_entry_price,
+            "live_exit_price": trade.live_exit_price,
+            "live_filled_amount": trade.live_filled_amount,
+            "live_entry_fee": trade.live_entry_fee,
+            "live_exit_fee": trade.live_exit_fee,
+            "live_status": trade.live_status,
+            "live_error": trade.live_error,
+            "live_raw_open_response_json": trade.live_raw_open_response_json,
+            "live_raw_close_response_json": trade.live_raw_close_response_json,
             "holding_seconds": trade.holding_seconds,
         }
 

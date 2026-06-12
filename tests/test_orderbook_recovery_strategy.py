@@ -10,12 +10,16 @@ import sys
 
 from src import db
 from src.Arbitrage.OrderBookSnapshotStore import OrderBookSnapshotStore
+from src.Exchange.ExchangeModel import Exchange
+from src.OrderBookRecovery.LiveExecutionService import LiveExecutionService
 from src.OrderBookRecovery.OrderBookRecoveryModel import StrategyRunTrade
 from src.OrderBookRecovery.OrderBookNormalizer import OrderBookNormalizer
 from src.OrderBookRecovery.OrderBookRecoveryService import OrderBookRecoveryService
 
 
 def make_config(service):
+    OrderBookRecoveryService._pending_entries.clear()
+    OrderBookRecoveryService._last_confirmation_results.clear()
     config = service.get_or_create_config()
     config.exchange = "binance"
     config.symbol = "BTC/USDT"
@@ -84,6 +88,68 @@ def add_snapshot(exchange, symbol="TON/USDT", bid=100, ask=100.01, bid_amount=10
         "bids": [[bid, bid_amount], [bid - 0.01, bid_amount], [bid - 0.02, bid_amount], [bid - 0.03, bid_amount], [bid - 0.04, bid_amount]],
         "asks": [[ask, ask_amount], [ask + 0.01, ask_amount], [ask + 0.02, ask_amount], [ask + 0.03, ask_amount], [ask + 0.04, ask_amount]],
     }, metadata={"source_exchange_title": exchange, "source_pair": symbol})
+
+
+def seed_live_exchange(title="Mexc", api_key="key", api_secret="secret"):
+    exchange = Exchange(title=title, enabled=True, api_key=api_key, api_secret=api_secret, password="", index=1)
+    db.session.add(exchange)
+    db.session.flush()
+    return exchange
+
+
+class MockLiveClient:
+    def __init__(self, fail_close=False, fail_open=False, markets=None, exchange_id="mock", fail_contract_open=False):
+        self.id = exchange_id
+        self.orders = []
+        self.contract_orders = []
+        self.fail_close = fail_close
+        self.fail_open = fail_open
+        self.fail_contract_open = fail_contract_open
+        self.markets = markets or {"TON/USDT": {"symbol": "TON/USDT", "swap": True, "contract": True, "base": "TON", "quote": "USDT", "settle": "USDT", "linear": True}}
+
+    def load_markets(self):
+        return self.markets
+
+    def set_leverage(self, leverage, symbol):
+        self.leverage = leverage
+
+    def amount_to_precision(self, symbol, amount):
+        return amount
+
+    def price_to_precision(self, symbol, price):
+        return price
+
+    def contractPrivatePostOrderSubmit(self, request):
+        if self.fail_contract_open:
+            return {"code": 500, "message": "contract open failed"}
+        order = {
+            "code": 200,
+            "data": f"contract-order-{len(self.contract_orders) + 1}",
+            "request": request,
+        }
+        self.contract_orders.append(order)
+        return order
+
+    def create_order(self, symbol, order_type, side, amount, price=None, params=None):
+        params = params or {}
+        if params.get("reduceOnly") and self.fail_close:
+            raise Exception("close failed")
+        if not params.get("reduceOnly") and self.fail_open:
+            raise Exception("open failed")
+        order = {
+            "id": f"order-{len(self.orders) + 1}",
+            "symbol": symbol,
+            "type": order_type,
+            "side": side,
+            "amount": amount,
+            "filled": amount,
+            "average": 100,
+            "status": "closed",
+            "fee": {"cost": 0.01},
+            "params": params,
+        }
+        self.orders.append(order)
+        return order
 
 
 def prime_momentum(service, config, exchange, symbol="TON/USDT", old_bid=99, old_ask=99.01):
@@ -1026,6 +1092,8 @@ def test_export_csv_includes_decision_snapshot_fields(client):
     assert "raw_average_imbalance" in row
     assert "anomalous_exchanges_count" in row
     assert "excluded_anomalous_imbalance_exchanges" in row
+    assert "execution_mode" in row
+    assert row["execution_mode"] == "paper"
     assert json.loads(row["decision_snapshot_json"])["selected_side"] == "long"
 
 
@@ -1205,6 +1273,653 @@ def setup_long_consensus(service, config, exchanges=None):
     for exchange in exchanges or ["Mexc", "Binance", "Bybit"]:
         prime_momentum(service, config, exchange)
         add_snapshot(exchange, bid=100, ask=100.01, bid_amount=10, ask_amount=5)
+
+
+def setup_short_consensus(service, config, exchanges=None, bid=98, ask=98.01):
+    for exchange in exchanges or ["Mexc", "Binance", "Bybit"]:
+        prime_momentum(service, config, exchange, old_bid=100, old_ask=100.01)
+        add_snapshot(exchange, bid=bid, ask=ask, bid_amount=4, ask_amount=10)
+
+
+def test_instant_entry_mode_opens_immediately(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.entry_mode = "instant"
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+
+    result = service.evaluate(config)
+
+    assert result["side"] == "long"
+    assert StrategyRunTrade.query.count() == 1
+    assert service.pending_entry_for(config) is None
+
+
+def test_paper_execution_mode_unchanged(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.execution_mode = "paper"
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+
+    service.evaluate(config)
+    trade = StrategyRunTrade.query.first()
+
+    assert trade.execution_mode == "paper"
+    assert trade.live_exchange_order_id is None
+
+
+def test_live_mode_blocked_when_confirmation_false(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = False
+    config.live_kill_switch = False
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    db.session.commit()
+
+    response = service.start_paper()
+
+    assert response.status_code == 400
+    assert response.get_json()["obj"]["msg"] == "live_confirmation_required"
+
+
+def test_live_mode_blocked_when_kill_switch_true(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = True
+    db.session.commit()
+
+    response = service.start_paper()
+
+    assert response.status_code == 400
+    assert response.get_json()["obj"]["msg"] == "live_kill_switch_enabled"
+
+
+def test_live_mode_blocked_without_api_keys(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc", api_key="", api_secret="")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "TON/USDT"
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    db.session.commit()
+
+    response = service.start_paper()
+
+    assert response.status_code == 400
+    assert response.get_json()["obj"]["msg"] == "live_exchange_credentials_required"
+
+
+def test_live_mode_blocked_when_margin_exceeds_limit(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "TON/USDT"
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    config.live_max_margin_usdt = 1
+    state = service.get_or_create_state(config)
+    state.current_margin = 7
+    db.session.commit()
+
+    response = service.start_paper()
+
+    assert response.status_code == 400
+    assert response.get_json()["obj"]["msg"] == "live_margin_exceeds_limit"
+
+
+def test_live_margin_limit_uses_margin_not_notional(client):
+    mock_client = MockLiveClient()
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client))
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "TON/USDT"
+    config.base_margin_usdt = 5
+    config.leverage = 2
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    config.live_max_margin_usdt = 5
+    state = service.get_or_create_state(config)
+    state.current_margin = 5
+    db.session.commit()
+    add_snapshot("Mexc", bid=100, ask=100.01, bid_amount=10, ask_amount=5)
+
+    response = service.start_paper()
+    debug = service.debug_payload(config, state)
+
+    assert response.status_code == 200
+    assert debug["current_margin"] == 5
+    assert debug["current_notional"] == 10
+    assert debug["live_max_margin_usdt"] == 5
+    assert debug["margin_limit_reason"] is None
+
+
+def test_live_config_fields_roundtrip_through_api(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    db.session.commit()
+
+    response = client.patch("/api/orderbook-recovery/config", json={
+        "execution_mode": "live",
+        "live_enabled_confirmation": True,
+        "live_kill_switch": False,
+        "live_max_margin_usdt": 9,
+        "live_max_daily_loss_usdt": 4,
+        "live_max_total_loss_usdt": 8,
+        "live_order_type": "market",
+    })
+    payload = response.get_json()["obj"]
+    refreshed = client.get("/api/orderbook-recovery/config").get_json()["obj"]
+
+    assert response.status_code == 200
+    assert payload["execution_mode"] == "live"
+    assert payload["live_enabled_confirmation"] is True
+    assert payload["live_kill_switch"] is False
+    assert payload["live_max_margin_usdt"] == 9
+    assert refreshed["execution_mode"] == "live"
+    assert refreshed["live_enabled_confirmation"] is True
+    assert refreshed["live_kill_switch"] is False
+
+
+def test_live_open_order_uses_mocked_ccxt(client):
+    mock_client = MockLiveClient()
+    live_service = LiveExecutionService(client_factory=lambda exchange: mock_client)
+    service = OrderBookRecoveryService(live_execution_service=live_service)
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "TON/USDT"
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+
+    result = service.evaluate(config)
+    trade = StrategyRunTrade.query.first()
+
+    assert result["execution_mode"] == "live"
+    assert trade.live_exchange_order_id == "order-1"
+    assert mock_client.orders[0]["side"] == "buy"
+    assert mock_client.orders[0]["params"]["reduceOnly"] is False
+
+
+def test_live_close_order_uses_reduce_only_mocked_ccxt(client):
+    mock_client = MockLiveClient()
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client))
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "TON/USDT"
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+    service.evaluate(config)
+    trade = StrategyRunTrade.query.first()
+
+    closed = service.close_trade(trade, 101, 1, "manual_close", service.get_or_create_state(config), config, datetime.utcnow())
+
+    assert closed["live_close_order_id"] == "order-2"
+    assert mock_client.orders[1]["params"]["reduceOnly"] is True
+    assert trade.closed_at is not None
+
+
+def test_live_errors_are_stored(client):
+    mock_client = MockLiveClient(fail_open=True)
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client))
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "TON/USDT"
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+
+    service.evaluate(config)
+    trade = StrategyRunTrade.query.first()
+
+    assert trade.live_status == "open_failed"
+    assert "open failed" in trade.live_error
+
+
+def test_mexc_open_failed_does_not_create_open_position(client):
+    mock_client = MockLiveClient(fail_contract_open=True, exchange_id="mexc")
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client))
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "TON/USDT"
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+
+    result = service.evaluate(config)
+    trade = StrategyRunTrade.query.first()
+    metrics = service.metrics()
+
+    assert result["live_status"] == "open_failed"
+    assert trade.closed_at is not None
+    assert service.open_trade(config) is None
+    assert service.open_positions_count(config) == 0
+    assert metrics["open_position"] is None
+
+
+def test_open_failed_excluded_from_win_loss_metrics(client):
+    mock_client = MockLiveClient(fail_open=True)
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client))
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "TON/USDT"
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+
+    service.evaluate(config)
+    metrics = service.metrics()
+
+    assert metrics["total_trades"] == 0
+    assert metrics["win_trades"] == 0
+    assert metrics["loss_trades"] == 0
+    assert metrics["net_pnl"] == 0
+
+
+def test_live_failed_attempt_cooldown_prevents_duplicate_attempts(client):
+    mock_client = MockLiveClient(fail_open=True)
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client))
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "TON/USDT"
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    config.live_open_failed_cooldown_seconds = 60
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+
+    now = datetime.utcnow()
+    service.evaluate(config, current_time=now)
+    service.evaluate(config, current_time=now + timedelta(seconds=10))
+
+    assert StrategyRunTrade.query.count() == 1
+    assert service.last_evaluation_for(config)["reject_reason"] == "live_open_failed_cooldown"
+
+
+def test_manual_close_live_failed_does_not_mark_trade_closed(client):
+    mock_client = MockLiveClient(fail_close=True)
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client))
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "TON/USDT"
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+    service.evaluate(config)
+    trade = StrategyRunTrade.query.first()
+
+    response = service.close_manual(trade.id, {"reason": "manual_close"})
+
+    assert response.status_code == 400
+    assert trade.closed_at is None
+    assert trade.live_status == "close_failed"
+
+
+def test_live_resolves_configured_symbol_to_swap_symbol(client):
+    service = LiveExecutionService()
+    client = MockLiveClient(markets={
+        "BTC/USDT": {"symbol": "BTC/USDT", "spot": True, "base": "BTC", "quote": "USDT"},
+        "BTC/USDT:USDT": {"symbol": "BTC/USDT:USDT", "swap": True, "contract": True, "linear": True, "base": "BTC", "quote": "USDT", "settle": "USDT", "type": "swap"},
+    })
+
+    market = service.resolve_live_futures_market(client, "BTC/USDT")
+
+    assert market["symbol"] == "BTC/USDT:USDT"
+
+
+def test_live_spot_market_is_rejected(client):
+    service = LiveExecutionService()
+    client = MockLiveClient(markets={
+        "BTC/USDT": {"symbol": "BTC/USDT", "spot": True, "base": "BTC", "quote": "USDT"},
+    })
+
+    try:
+        service.resolve_live_futures_market(client, "BTC/USDT")
+    except Exception as error:
+        assert str(error) == "live_futures_market_not_found"
+    else:
+        assert False, "spot market should not be accepted for live futures"
+
+
+def test_live_swap_market_is_accepted(client):
+    service = LiveExecutionService()
+    client = MockLiveClient(markets={
+        "BTC/USDT:USDT": {"symbol": "BTC/USDT:USDT", "swap": True, "linear": True, "base": "BTC", "quote": "USDT", "settle": "USDT"},
+    })
+
+    market = service.resolve_live_futures_market(client, "BTC/USDT")
+
+    assert market["swap"] is True
+
+
+def test_live_create_order_uses_resolved_futures_symbol(client):
+    mock_client = MockLiveClient(markets={
+        "BTC/USDT": {"symbol": "BTC/USDT", "spot": True, "base": "BTC", "quote": "USDT"},
+        "BTC/USDT:USDT": {"symbol": "BTC/USDT:USDT", "swap": True, "contract": True, "linear": True, "base": "BTC", "quote": "USDT", "settle": "USDT"},
+    })
+    service = LiveExecutionService(client_factory=lambda exchange: mock_client)
+    config = make_config(OrderBookRecoveryService())
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "BTC/USDT"
+    config.live_order_type = "market"
+    db.session.commit()
+
+    service.open_position(config, "long", 7, 2, 100)
+
+    assert mock_client.orders[0]["symbol"] == "BTC/USDT:USDT"
+
+
+def test_successful_mocked_mexc_futures_order_opens_trade(client):
+    mock_client = MockLiveClient(exchange_id="mexc", markets={
+        "BTC/USDT": {"symbol": "BTC/USDT", "spot": True, "base": "BTC", "quote": "USDT"},
+        "BTC/USDT:USDT": {
+            "id": "BTC_USDT",
+            "symbol": "BTC/USDT:USDT",
+            "type": "swap",
+            "swap": True,
+            "contract": True,
+            "linear": True,
+            "base": "BTC",
+            "quote": "USDT",
+            "settle": "USDT",
+            "contractSize": 0.001,
+        },
+    })
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client))
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "BTC/USDT"
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    config.feedback_enabled = False
+    db.session.commit()
+    for source_exchange in ["Mexc", "Binance", "Bybit"]:
+        prime_momentum(service, config, source_exchange, symbol="BTC/USDT")
+        add_snapshot(source_exchange, symbol="BTC/USDT", bid=100, ask=100.01, bid_amount=10, ask_amount=5)
+
+    result = service.evaluate(config)
+    trade = StrategyRunTrade.query.first()
+
+    assert result["live_status"] == "open"
+    assert trade.closed_at is None
+    assert trade.live_exchange_order_id == "contract-order-1"
+    assert mock_client.contract_orders[0]["request"]["symbol"] == "BTC_USDT"
+    assert mock_client.contract_orders[0]["request"]["side"] == 1
+    assert mock_client.contract_orders[0]["request"]["openType"] == 1
+
+
+def test_mexc_client_uses_swap_options(client):
+    captured = {}
+
+    class FakeMexc:
+        def __init__(self, options):
+            captured.update(options)
+
+    original = getattr(__import__("ccxt"), "mexc")
+    setattr(__import__("ccxt"), "mexc", FakeMexc)
+    try:
+        service = LiveExecutionService()
+        config = make_config(OrderBookRecoveryService())
+        exchange = seed_live_exchange("Mexc")
+        config.exchange = "Mexc"
+        config.exchange_id = exchange.id
+        db.session.commit()
+        service.client(config)
+    finally:
+        setattr(__import__("ccxt"), "mexc", original)
+
+    assert captured["options"]["defaultType"] == "swap"
+    assert captured["options"]["defaultSettle"] == "USDT"
+
+
+def test_debug_returns_live_market_fields(client):
+    mock_client = MockLiveClient(markets={
+        "BTC/USDT:USDT": {"symbol": "BTC/USDT:USDT", "swap": True, "linear": True, "base": "BTC", "quote": "USDT", "settle": "USDT", "type": "swap"},
+    })
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client))
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "BTC/USDT"
+    config.execution_mode = "live"
+    db.session.commit()
+
+    debug = service.debug_payload(config, service.get_or_create_state(config))
+
+    assert debug["resolved_live_symbol"] == "BTC/USDT:USDT"
+    assert debug["live_market_type"] == "swap"
+    assert debug["live_market_valid"] is True
+    assert debug["live_market_error"] is None
+
+
+def test_two_step_mode_creates_pending_entry_without_opening(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.entry_mode = "two_step_confirmation"
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+
+    result = service.evaluate(config)
+
+    assert result is None
+    assert StrategyRunTrade.query.count() == 0
+    assert service.pending_entry_for(config)["side"] == "long"
+    assert service.last_evaluation_for(config)["reject_reason"] == "confirmation_pending"
+
+
+def test_two_step_long_opens_after_confirmation(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.entry_mode = "two_step_confirmation"
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+    now = datetime.utcnow()
+
+    service.evaluate(config, current_time=now)
+    result = service.evaluate(config, current_time=now + timedelta(seconds=2))
+    trade = StrategyRunTrade.query.first()
+
+    assert result["side"] == "long"
+    assert trade.entry_mode == "two_step_confirmation"
+    assert trade.confirmation_result == "confirmed"
+    assert trade.confirmation_delay_actual_seconds == 2
+    assert service.pending_entry_for(config) is None
+
+
+def test_two_step_short_opens_after_confirmation(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.entry_mode = "two_step_confirmation"
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_short_consensus(service, config)
+    now = datetime.utcnow()
+
+    service.evaluate(config, current_time=now)
+    result = service.evaluate(config, current_time=now + timedelta(seconds=2))
+
+    assert result["side"] == "short"
+    assert StrategyRunTrade.query.first().entry_mode == "two_step_confirmation"
+
+
+def test_two_step_cancels_if_direction_flips(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.entry_mode = "two_step_confirmation"
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+    now = datetime.utcnow()
+    service.evaluate(config, current_time=now)
+    setup_short_consensus(service, config)
+
+    result = service.evaluate(config, current_time=now + timedelta(seconds=2))
+
+    assert result is None
+    assert StrategyRunTrade.query.count() == 0
+    assert service.pending_entry_for(config) is None
+    assert service.last_evaluation_for(config)["reject_reason"] == "confirmation_failed_direction_changed"
+
+
+def test_two_step_cancels_if_consensus_becomes_invalid(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.entry_mode = "two_step_confirmation"
+    config.feedback_enabled = False
+    config.confirmation_max_wait_seconds = 10
+    db.session.commit()
+    setup_long_consensus(service, config)
+    now = datetime.utcnow()
+
+    service.evaluate(config, current_time=now)
+    result = service.evaluate(config, current_time=now + timedelta(seconds=6))
+
+    assert result is None
+    assert StrategyRunTrade.query.count() == 0
+    assert service.pending_entry_for(config) is None
+    assert service.last_evaluation_for(config)["reject_reason"] == "confirmation_failed_configured_exchange_invalid"
+
+
+def test_two_step_cancels_if_momentum_weakens(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.entry_mode = "two_step_confirmation"
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+    now = datetime.utcnow()
+    service.evaluate(config, current_time=now)
+    for exchange in ["Mexc", "Binance", "Bybit"]:
+        add_snapshot(exchange, bid=99.5, ask=99.51, bid_amount=10, ask_amount=5)
+
+    result = service.evaluate(config, current_time=now + timedelta(seconds=2))
+
+    assert result is None
+    assert StrategyRunTrade.query.count() == 0
+    assert service.pending_entry_for(config) is None
+    assert service.last_evaluation_for(config)["reject_reason"] == "confirmation_failed_momentum_not_improved"
+
+
+def test_two_step_expires_after_max_wait(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.entry_mode = "two_step_confirmation"
+    config.feedback_enabled = False
+    config.max_snapshot_age_seconds = 60
+    db.session.commit()
+    setup_long_consensus(service, config)
+    now = datetime.utcnow()
+
+    service.evaluate(config, current_time=now)
+    result = service.evaluate(config, current_time=now + timedelta(seconds=6))
+
+    assert result is None
+    assert StrategyRunTrade.query.count() == 0
+    assert service.pending_entry_for(config) is None
+    assert service.last_evaluation_for(config)["reject_reason"] == "confirmation_expired"
+
+
+def test_export_includes_confirmation_fields(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.entry_mode = "two_step_confirmation"
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+    now = datetime.utcnow()
+    service.evaluate(config, current_time=now)
+    service.evaluate(config, current_time=now + timedelta(seconds=2))
+    trade = StrategyRunTrade.query.first()
+    trade.closed_at = datetime.utcnow()
+    trade.exit_price = trade.entry_price + 1
+    trade.pnl = 1
+    trade.result = "win"
+    db.session.commit()
+
+    row = csv_rows(client.get("/api/orderbook-recovery/trades/export"))[0]
+
+    assert row["entry_mode"] == "two_step_confirmation"
+    assert row["confirmation_delay_actual_seconds"] == "2.0"
+    assert row["first_signal_snapshot_json"]
+    assert row["confirmation_snapshot_json"]
 
 
 def test_strategy_does_not_open_during_recovery_pause(client):
@@ -1569,6 +2284,27 @@ def test_frontend_export_api_method_exists():
     assert "No non-archived closed trades to export" in frontend_view
     assert "exportTrades" in frontend_api
     assert "/orderbook-recovery/trades/export" in frontend_api
+
+
+def test_frontend_entry_mode_controls_exist():
+    frontend_view = Path("/Users/emilhambardzumyan/WebstormProjects/arbinator/src/views/orderBookRecovery/v-order-book-recovery.vue").read_text()
+
+    assert "Entry mode" in frontend_view
+    assert "two_step_confirmation" in frontend_view
+    assert "Confirmation delay sec" in frontend_view
+    assert "Require same direction" in frontend_view
+    assert "Pending Entry" in frontend_view
+    assert "pending_entry_exists" in frontend_view
+    assert "Execution mode" in frontend_view
+    assert "Live enabled confirmation" in frontend_view
+    assert "Live kill switch" in frontend_view
+    assert "WARNING: Live mode places real orders on the selected exchange." in frontend_view
+    assert "You are enabling LIVE trading. Real orders may be placed on the exchange." in frontend_view
+    assert "Live max margin USDT" in frontend_view
+    assert "Resolved live symbol" in frontend_view
+    assert "Live market type" in frontend_view
+    assert "Live market valid" in frontend_view
+    assert "Live market error" in frontend_view
 
 
 def test_alembic_upgrade_head_succeeds_and_keeps_required_tables(tmp_path):

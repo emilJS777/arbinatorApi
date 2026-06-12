@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from decimal import Decimal, ROUND_DOWN
 
 import ccxt
 import requests
@@ -196,6 +197,65 @@ class LiveExecutionService:
             return float(base_amount) / float(contract_size)
         return float(base_amount)
 
+    def fetch_mexc_contract_detail(self, market):
+        symbol_id = market.get("id") or market.get("symbol")
+        response = self.requests.get(
+            "https://contract.mexc.com/api/v1/contract/detail",
+            params={"symbol": symbol_id},
+            timeout=10,
+        )
+        if not response.ok:
+            raise LiveExecutionError(f"live_mexc_contract_detail_failed:{response.status_code}:{response.text[:300]}")
+        payload = response.json()
+        data = payload.get("data")
+        if isinstance(data, list):
+            detail = next((item for item in data if item.get("symbol") == symbol_id), data[0] if data else None)
+        else:
+            detail = data
+        if not isinstance(detail, dict):
+            raise LiveExecutionError("live_mexc_contract_detail_missing")
+        return detail
+
+    def decimal_places(self, value):
+        decimal = Decimal(str(value))
+        return max(0, -decimal.as_tuple().exponent)
+
+    def quantize_vol(self, value, vol_scale):
+        step = Decimal("1") if int(vol_scale or 0) <= 0 else Decimal("1").scaleb(-int(vol_scale))
+        return Decimal(str(value)).quantize(step, rounding=ROUND_DOWN)
+
+    def normalize_mexc_contract_volume(self, market, base_amount, contract_detail=None):
+        detail = contract_detail or {}
+        contract_size = Decimal(str(detail.get("contractSize") or market.get("contractSize") or market.get("contract_size") or "1"))
+        raw_vol = Decimal(str(base_amount)) / contract_size
+        vol_scale = int(detail.get("volScale", self.decimal_places(detail.get("volUnit", 1))))
+        vol_unit = Decimal(str(detail.get("volUnit") or "1"))
+        min_vol = Decimal(str(detail.get("minVol") or "0"))
+        max_vol = Decimal(str(detail.get("maxVol") or "0"))
+        rounded = self.quantize_vol(raw_vol, vol_scale)
+        if vol_unit > 0:
+            units = (rounded / vol_unit).to_integral_value(rounding=ROUND_DOWN)
+            rounded = units * vol_unit
+            rounded = self.quantize_vol(rounded, vol_scale)
+        below_min = bool(min_vol and rounded < min_vol)
+        above_max = bool(max_vol and rounded > max_vol)
+        if below_min:
+            raise LiveExecutionError(f"live_mexc_order_below_min_vol:calculated_vol={rounded}:minVol={min_vol}")
+        if above_max:
+            raise LiveExecutionError(f"live_mexc_order_above_max_vol:calculated_vol={rounded}:maxVol={max_vol}")
+        return float(rounded), {
+            "raw_vol": float(raw_vol),
+            "rounded_vol": float(rounded),
+            "contract_size": float(contract_size),
+            "vol_scale": vol_scale,
+            "vol_unit": float(vol_unit),
+            "min_vol": float(min_vol),
+            "max_vol": float(max_vol) if max_vol else None,
+            "below_min_vol": below_min,
+            "above_max_vol": above_max,
+            "api_allowed": detail.get("apiAllowed"),
+        }
+
     def amount_to_precision(self, client, symbol, amount):
         if hasattr(client, "amount_to_precision"):
             return float(client.amount_to_precision(symbol, amount))
@@ -226,10 +286,11 @@ class LiveExecutionService:
         if success is False or (code not in (None, 0, 200, "0", "200")):
             raise LiveExecutionError(f"live_mexc_order_failed:{response}")
 
-    def build_mexc_order_submit_request(self, client, market, order_type, side, amount, price=None, reduce_only=False, leverage=None):
+    def build_mexc_order_submit_request(self, client, market, order_type, side, amount, price=None, reduce_only=False, leverage=None, contract_detail=None):
         symbol = market.get("symbol")
         request_type = self.mexc_order_type(order_type)
-        vol = self.amount_to_precision(client, symbol, self.contract_amount(market, amount))
+        detail = contract_detail or self.fetch_mexc_contract_detail(market)
+        vol, volume_details = self.normalize_mexc_contract_volume(market, amount, detail)
         body = {
             "symbol": market.get("id") or symbol,
             "vol": vol,
@@ -263,6 +324,8 @@ class LiveExecutionService:
                 "input_order_type": order_type,
                 "mexc_type": request_type,
             },
+            "contract_detail": detail,
+            "volume_details": volume_details,
         }
 
     def sanitize_signed_order_request(self, signed_request):
@@ -278,6 +341,8 @@ class LiveExecutionService:
             "resolved_symbol": signed_request["resolved_symbol"],
             "side_mapping": signed_request["side_mapping"],
             "order_type_mapping": signed_request["order_type_mapping"],
+            "contract_detail": signed_request.get("contract_detail"),
+            "volume_details": signed_request.get("volume_details"),
         }
 
     def submit_mexc_signed_order(self, signed_request):

@@ -1,4 +1,6 @@
 from src import db
+import json
+
 from src.Exchange.ExchangeModel import Exchange
 from src.Live.MexcDiagnosticsService import MexcDiagnosticsService
 from src.Live.MexcOrderSubmitDryCheckService import MexcOrderSubmitDryCheckService
@@ -10,6 +12,9 @@ class FakeResponse:
         self.status_code = status_code
         self.text = text
         self.ok = 200 <= status_code < 300
+
+    def json(self):
+        return json.loads(self.text)
 
 
 class FakeRequests:
@@ -45,6 +50,17 @@ class FakeOrderSubmitRequests:
             "timeout": timeout,
         })
         return FakeResponse(200, '{"code":200,"data":"dry-real-order-id"}')
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append({
+            "method": "GET",
+            "url": url,
+            "params": params or {},
+            "timeout": timeout,
+        })
+        if "contract/detail" in url:
+            return FakeResponse(200, '{"success":true,"code":0,"data":{"symbol":"BTC_USDT","contractSize":0.001,"minVol":1,"maxVol":1000000,"volScale":0,"volUnit":1,"apiAllowed":true}}')
+        return FakeResponse(404, "not found")
 
 
 class FakeMexcClient:
@@ -193,7 +209,9 @@ def test_mexc_order_submit_drycheck_builds_expected_body_and_does_not_send(clien
     }).get_json()["obj"]
 
     assert payload["dry_run"] is True
-    assert requests_client.calls == []
+    assert len(requests_client.calls) == 1
+    assert requests_client.calls[0]["method"] == "GET"
+    assert "contract/detail" in requests_client.calls[0]["url"]
     assert payload["endpoint"] == "https://contract.mexc.com/api/v1/private/order/submit"
     assert payload["method"] == "POST"
     assert payload["body"]["symbol"] == "BTC_USDT"
@@ -203,6 +221,11 @@ def test_mexc_order_submit_drycheck_builds_expected_body_and_does_not_send(clien
     assert payload["body"]["type"] == 5
     assert payload["body"]["openType"] == 1
     assert payload["body"]["leverage"] == 1
+    assert payload["contract_detail"]["contractSize"] == 0.001
+    assert payload["volume_details"]["raw_vol"] == 10
+    assert payload["volume_details"]["rounded_vol"] == 10
+    assert payload["volume_details"]["min_vol"] == 1
+    assert payload["volume_details"]["api_allowed"] is True
     assert payload["order_type_mapping"]["mexc_type"] == 5
     assert payload["side_mapping"]["mexc_side"] == 1
     assert "api-key-value" not in str(payload)
@@ -243,7 +266,7 @@ def test_mexc_order_submit_signature_payload_matches_sent_body(client):
         "price": 100,
     }).get_json()["obj"]
 
-    sent = requests_client.calls[0]
+    sent = requests_client.calls[1]
     assert payload["confirm_real_order_test"] is True
     assert payload["real_order_sent"] is True
     assert sent["url"] == payload["endpoint"]
@@ -256,7 +279,9 @@ def test_mexc_order_submit_signature_payload_matches_sent_body(client):
 def test_mexc_order_submit_drycheck_route(client, monkeypatch):
     seed_mexc()
     fake_ccxt = FakeCcxt()
+    fake_requests = FakeOrderSubmitRequests()
     monkeypatch.setattr("src.OrderBookRecovery.LiveExecutionService.ccxt", fake_ccxt)
+    monkeypatch.setattr("src.OrderBookRecovery.LiveExecutionService.requests", fake_requests)
 
     response = client.post("/api/live/mexc-order-submit-drycheck", json={
         "symbol": "BTC/USDT",
@@ -270,3 +295,21 @@ def test_mexc_order_submit_drycheck_route(client, monkeypatch):
     assert response.status_code == 200
     assert payload["dry_run"] is True
     assert payload["body"]["type"] == 5
+
+
+def test_mexc_order_submit_rejects_below_min_contract_volume(client):
+    seed_mexc()
+    service = MexcOrderSubmitDryCheckService(
+        live_execution_service=LiveExecutionService(client_factory=lambda _exchange: FakeMexcClient({"apiKey": "api-key-value", "secret": "secret-value"}), requests_client=FakeOrderSubmitRequests())
+    )
+
+    response = service.run({
+        "symbol": "BTC/USDT",
+        "margin_usdt": 1,
+        "leverage": 1,
+        "side": "long",
+        "price": 100000,
+    })
+
+    assert response.status_code == 400
+    assert "live_mexc_order_below_min_vol" in response.get_json()["obj"]["msg"]

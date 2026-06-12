@@ -192,6 +192,15 @@ class MockMexcSubmitRequests:
         })
         return self.Response(self.status_code, self.text)
 
+    def get(self, url, params=None, timeout=None):
+        self.calls.append({
+            "method": "GET",
+            "url": url,
+            "params": params or {},
+            "timeout": timeout,
+        })
+        return self.Response(200, '{"success":true,"code":0,"data":{"symbol":"BTC_USDT","contractSize":0.001,"minVol":1,"maxVol":1000000,"volScale":0,"volUnit":1,"apiAllowed":true}}')
+
 
 def prime_momentum(service, config, exchange, symbol="TON/USDT", old_bid=99, old_ask=99.01):
     snapshot = {
@@ -1745,8 +1754,10 @@ def test_successful_mocked_mexc_futures_order_opens_trade(client):
     assert result["live_status"] == "open"
     assert trade.closed_at is None
     assert trade.live_exchange_order_id == "contract-order-1"
-    sent_body = json.loads(requests_client.calls[0]["data"])
-    assert requests_client.calls[0]["url"] == "https://contract.mexc.com/api/v1/private/order/submit"
+    sent_body = json.loads(requests_client.calls[1]["data"])
+    assert requests_client.calls[0]["url"] == "https://contract.mexc.com/api/v1/contract/detail"
+    assert requests_client.calls[0]["params"] == {"symbol": "BTC_USDT"}
+    assert requests_client.calls[1]["url"] == "https://contract.mexc.com/api/v1/private/order/submit"
     assert sent_body["symbol"] == "BTC_USDT"
     assert sent_body["side"] == 1
     assert sent_body["openType"] == 1

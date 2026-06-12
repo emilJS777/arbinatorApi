@@ -71,6 +71,7 @@ class MexcOrderSubmitDryCheckService(Response):
             inputs = self.order_inputs(body or {})
             client = self.client(exchange)
             market = self.live_execution_service.resolve_live_futures_market(client, inputs["symbol"])
+            contract_detail = self.live_execution_service.fetch_mexc_contract_detail(market)
             signed = self.live_execution_service.build_mexc_order_submit_request(
                 client,
                 market,
@@ -80,6 +81,7 @@ class MexcOrderSubmitDryCheckService(Response):
                 inputs["price"],
                 False,
                 inputs["leverage"],
+                contract_detail=contract_detail,
             )
             payload = self.live_execution_service.sanitize_signed_order_request(signed)
             payload.update({

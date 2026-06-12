@@ -141,6 +141,10 @@ class OrderBookRecoveryService(Response):
             "min_consensus_ratio",
             "max_snapshot_age_seconds",
             "require_configured_exchange_signal",
+            "use_median_imbalance",
+            "imbalance_anomaly_min",
+            "imbalance_anomaly_max",
+            "exclude_anomalous_imbalance",
             "cooldown_after_max_recovery_seconds",
             "feedback_enabled",
             "feedback_lookback_trades",
@@ -175,6 +179,16 @@ class OrderBookRecoveryService(Response):
             state.current_margin = config.base_margin_usdt
         db.session.commit()
         return self.response_ok(self.config_to_dict(config))
+
+    @staticmethod
+    def median(values):
+        values = sorted(value for value in values if value is not None)
+        if not values:
+            return None
+        middle = len(values) // 2
+        if len(values) % 2:
+            return values[middle]
+        return (values[middle - 1] + values[middle]) / 2
 
     def start_paper(self):
         config = self.get_or_create_config()
@@ -380,6 +394,24 @@ class OrderBookRecoveryService(Response):
         db.session.commit()
         return self.response_ok({"unarchived_count": len(trades)})
 
+    def delete_archived_trade(self, trade_id: int):
+        trade = db.session.get(StrategyRunTrade, trade_id)
+        if not trade:
+            return self.response_not_found("Trade not found")
+        if not trade.is_archived:
+            return self.response(False, {"msg": "cannot_delete_non_archived_trade"}, 400)
+        db.session.delete(trade)
+        db.session.commit()
+        return self.response_ok({"deleted_trade_id": trade_id})
+
+    def delete_all_archived_trades(self):
+        trades = StrategyRunTrade.query.filter_by(is_archived=True).all()
+        deleted_count = len(trades)
+        for trade in trades:
+            db.session.delete(trade)
+        db.session.commit()
+        return self.response_ok({"deleted_count": deleted_count})
+
     def decision_details(self, trade_id: int):
         trade = db.session.get(StrategyRunTrade, trade_id)
         if not trade:
@@ -411,6 +443,8 @@ class OrderBookRecoveryService(Response):
             "pnl", "result", "close_reason", "opened_at", "closed_at", "holding_seconds",
             "consensus_direction", "valid_exchanges_count", "confirming_long_count", "confirming_short_count",
             "consensus_ratio_long", "consensus_ratio_short", "average_imbalance", "average_momentum",
+            "median_imbalance", "raw_average_imbalance", "anomalous_exchanges_count",
+            "excluded_anomalous_imbalance_exchanges",
             "configured_exchange_imbalance", "configured_exchange_spread", "configured_exchange_momentum", "entry_reason",
             "feedback_enabled", "long_recent_win_rate", "short_recent_win_rate", "long_loss_streak", "short_loss_streak",
             "adaptive_min_consensus_ratio", "adaptive_min_valid_exchanges", "blocked_side", "feedback_reject_reason",
@@ -446,6 +480,16 @@ class OrderBookRecoveryService(Response):
             "consensus_ratio_long": trade.consensus_ratio_long or trade.signal_consensus_ratio_long,
             "consensus_ratio_short": trade.consensus_ratio_short or trade.signal_consensus_ratio_short,
             "average_imbalance": trade.average_imbalance or trade.signal_average_imbalance,
+            "median_imbalance": trade.median_imbalance or trade.signal_median_imbalance or (snapshot.get("consensus_decision") or {}).get("median_imbalance"),
+            "raw_average_imbalance": trade.raw_average_imbalance or trade.signal_raw_average_imbalance or (snapshot.get("consensus_decision") or {}).get("raw_average_imbalance"),
+            "anomalous_exchanges_count": trade.anomalous_exchanges_count if trade.anomalous_exchanges_count is not None else (
+                trade.signal_anomalous_exchanges_count if trade.signal_anomalous_exchanges_count is not None else (snapshot.get("consensus_decision") or {}).get("anomalous_exchanges_count")
+            ),
+            "excluded_anomalous_imbalance_exchanges": (
+                trade.excluded_anomalous_imbalance_exchanges_json
+                or trade.signal_excluded_anomalous_imbalance_exchanges_json
+                or json.dumps((snapshot.get("consensus_decision") or {}).get("excluded_anomalous_imbalance_exchanges") or [])
+            ),
             "average_momentum": trade.average_momentum or trade.signal_average_momentum,
             "configured_exchange_imbalance": trade.configured_exchange_imbalance or trade.signal_configured_exchange_imbalance,
             "configured_exchange_spread": trade.configured_exchange_spread or trade.signal_configured_exchange_spread,
@@ -503,6 +547,13 @@ class OrderBookRecoveryService(Response):
                 "consensus_ratio_long": trade.consensus_ratio_long or trade.signal_consensus_ratio_long,
                 "consensus_ratio_short": trade.consensus_ratio_short or trade.signal_consensus_ratio_short,
                 "average_imbalance": trade.average_imbalance or trade.signal_average_imbalance,
+                "median_imbalance": trade.median_imbalance or trade.signal_median_imbalance,
+                "raw_average_imbalance": trade.raw_average_imbalance or trade.signal_raw_average_imbalance,
+                "anomalous_exchanges_count": trade.anomalous_exchanges_count if trade.anomalous_exchanges_count is not None else trade.signal_anomalous_exchanges_count,
+                "excluded_anomalous_imbalance_exchanges": self.parse_json(
+                    trade.excluded_anomalous_imbalance_exchanges_json
+                    or trade.signal_excluded_anomalous_imbalance_exchanges_json
+                ) or [],
                 "average_momentum": trade.average_momentum or trade.signal_average_momentum,
                 "configured_exchange_imbalance": trade.configured_exchange_imbalance or trade.signal_configured_exchange_imbalance,
                 "configured_exchange_spread": trade.configured_exchange_spread or trade.signal_configured_exchange_spread,
@@ -771,6 +822,12 @@ class OrderBookRecoveryService(Response):
             "consensus_ratio_long": consensus.get("consensus_ratio_long"),
             "consensus_ratio_short": consensus.get("consensus_ratio_short"),
             "average_imbalance": consensus.get("average_imbalance"),
+            "median_imbalance": consensus.get("median_imbalance"),
+            "raw_average_imbalance": consensus.get("raw_average_imbalance"),
+            "anomalous_exchanges_count": consensus.get("anomalous_exchanges_count"),
+            "imbalance_anomaly_min": consensus.get("imbalance_anomaly_min"),
+            "imbalance_anomaly_max": consensus.get("imbalance_anomaly_max"),
+            "excluded_anomalous_imbalance_exchanges": consensus.get("excluded_anomalous_imbalance_exchanges") or [],
             "average_momentum": consensus.get("average_momentum"),
             "consensus_direction": consensus.get("consensus_direction") or "none",
             "entry_blocked_reason": consensus.get("reject_reason") or (self.last_evaluation_for(config) or {}).get("reject_reason"),
@@ -862,6 +919,9 @@ class OrderBookRecoveryService(Response):
             "bid_volume_top_5": None,
             "ask_volume_top_5": None,
             "imbalance": None,
+            "raw_imbalance": None,
+            "capped_imbalance": None,
+            "is_imbalance_anomaly": False,
             "spread_percent": None,
             "momentum": None,
             "snapshot_age_seconds": age,
@@ -876,20 +936,32 @@ class OrderBookRecoveryService(Response):
         if error:
             item["reject_reason"] = error
             return item
+        raw_imbalance = features["imbalance"]
+        anomaly_min = float(config.imbalance_anomaly_min)
+        anomaly_max = float(config.imbalance_anomaly_max)
+        is_anomaly = raw_imbalance < anomaly_min or raw_imbalance > anomaly_max
         item.update({
             "bid_volume_top_5": features["bid_volume_top_5"],
             "ask_volume_top_5": features["ask_volume_top_5"],
-            "imbalance": features["imbalance"],
+            "imbalance": raw_imbalance,
+            "raw_imbalance": raw_imbalance,
+            "capped_imbalance": min(max(raw_imbalance, anomaly_min), anomaly_max),
+            "is_imbalance_anomaly": bool(is_anomaly),
             "spread_percent": features["spread_percent"],
             "momentum": features["short_momentum"],
-            "long_signal": features["imbalance"] > config.long_imbalance_threshold,
-            "short_signal": features["imbalance"] < config.short_imbalance_threshold,
+            "long_signal": raw_imbalance > config.long_imbalance_threshold,
+            "short_signal": raw_imbalance < config.short_imbalance_threshold,
         })
         if age is not None and age > float(config.max_snapshot_age_seconds):
             item["reject_reason"] = "stale_snapshot"
             return item
         if features["spread_percent"] > config.max_spread_percent:
             item["reject_reason"] = "spread_too_high"
+            return item
+        if config.exclude_anomalous_imbalance and is_anomaly:
+            item["reject_reason"] = "imbalance_anomaly"
+            item["long_signal"] = False
+            item["short_signal"] = False
             return item
         item["valid"] = True
         return item
@@ -901,6 +973,15 @@ class OrderBookRecoveryService(Response):
         long_count = len([row for row in valid if row["long_signal"]])
         short_count = len([row for row in valid if row["short_signal"]])
         valid_count = len(valid)
+        valid_imbalances = [row["imbalance"] for row in valid if row.get("imbalance") is not None]
+        raw_imbalances = [row["raw_imbalance"] for row in rows if row.get("raw_imbalance") is not None]
+        anomalous_rows = [row for row in rows if row.get("is_imbalance_anomaly")]
+        excluded_anomalous = [
+            f"{row.get('exchange')}:{row.get('symbol')}"
+            for row in anomalous_rows
+            if row.get("reject_reason") == "imbalance_anomaly"
+        ]
+        median_imbalance = self.median(valid_imbalances)
         configured_row = next(
             (row for row in rows if self.normalize_exchange(row["exchange"]) == self.normalize_exchange(config.exchange)),
             None,
@@ -911,7 +992,13 @@ class OrderBookRecoveryService(Response):
             "confirming_short_count": short_count,
             "consensus_ratio_long": (long_count / valid_count) if valid_count else 0,
             "consensus_ratio_short": (short_count / valid_count) if valid_count else 0,
-            "average_imbalance": (sum(row["imbalance"] for row in valid) / valid_count) if valid_count else 0,
+            "average_imbalance": (sum(valid_imbalances) / len(valid_imbalances)) if valid_imbalances else 0,
+            "median_imbalance": median_imbalance,
+            "raw_average_imbalance": (sum(raw_imbalances) / len(raw_imbalances)) if raw_imbalances else 0,
+            "anomalous_exchanges_count": len(excluded_anomalous),
+            "imbalance_anomaly_min": float(config.imbalance_anomaly_min),
+            "imbalance_anomaly_max": float(config.imbalance_anomaly_max),
+            "excluded_anomalous_imbalance_exchanges": excluded_anomalous,
             "average_momentum": (sum(row["momentum"] for row in valid) / valid_count) if valid_count else 0,
             "configured_exchange_valid": bool(configured_row and configured_row["valid"]),
             "configured_exchange_long_signal": bool(configured_row and configured_row["long_signal"]),
@@ -953,6 +1040,10 @@ class OrderBookRecoveryService(Response):
         if not consensus["configured_exchange_valid"]:
             consensus["reject_reason"] = consensus.get("configured_exchange_reject_reason") or "configured_exchange_snapshot_missing_or_invalid"
             return None, consensus
+        median_imbalance = consensus.get("median_imbalance")
+        if config.use_median_imbalance and median_imbalance is None:
+            consensus["reject_reason"] = "no_valid_median_imbalance"
+            return None, consensus
 
         min_count = int(config.min_confirming_exchanges)
         min_ratio = float(config.min_consensus_ratio)
@@ -966,6 +1057,9 @@ class OrderBookRecoveryService(Response):
             and consensus["consensus_ratio_short"] >= min_ratio
             and consensus["average_momentum"] < 0
         )
+        if config.use_median_imbalance:
+            long_ok = long_ok and median_imbalance > float(config.long_imbalance_threshold)
+            short_ok = short_ok and median_imbalance < float(config.short_imbalance_threshold)
         if config.require_configured_exchange_signal:
             long_ok = long_ok and consensus["configured_exchange_long_signal"]
             short_ok = short_ok and consensus["configured_exchange_short_signal"]
@@ -1071,6 +1165,12 @@ class OrderBookRecoveryService(Response):
                 "consensus_ratio_long": consensus.get("consensus_ratio_long"),
                 "consensus_ratio_short": consensus.get("consensus_ratio_short"),
                 "average_imbalance": consensus.get("average_imbalance"),
+                "median_imbalance": consensus.get("median_imbalance"),
+                "raw_average_imbalance": consensus.get("raw_average_imbalance"),
+                "anomalous_exchanges_count": consensus.get("anomalous_exchanges_count"),
+                "excluded_anomalous_imbalance_exchanges": consensus.get("excluded_anomalous_imbalance_exchanges") or [],
+                "imbalance_anomaly_min": consensus.get("imbalance_anomaly_min"),
+                "imbalance_anomaly_max": consensus.get("imbalance_anomaly_max"),
                 "average_momentum": consensus.get("average_momentum"),
                 "configured_exchange_imbalance": consensus.get("configured_exchange_imbalance"),
                 "configured_exchange_spread": consensus.get("configured_exchange_spread"),
@@ -1117,6 +1217,10 @@ class OrderBookRecoveryService(Response):
             signal_consensus_ratio_long=consensus.get("consensus_ratio_long"),
             signal_consensus_ratio_short=consensus.get("consensus_ratio_short"),
             signal_average_imbalance=consensus.get("average_imbalance"),
+            signal_median_imbalance=consensus.get("median_imbalance"),
+            signal_raw_average_imbalance=consensus.get("raw_average_imbalance"),
+            signal_anomalous_exchanges_count=consensus.get("anomalous_exchanges_count"),
+            signal_excluded_anomalous_imbalance_exchanges_json=json.dumps(consensus.get("excluded_anomalous_imbalance_exchanges") or []),
             signal_average_momentum=consensus.get("average_momentum"),
             signal_configured_exchange_imbalance=consensus.get("configured_exchange_imbalance"),
             signal_configured_exchange_spread=consensus.get("configured_exchange_spread"),
@@ -1132,6 +1236,10 @@ class OrderBookRecoveryService(Response):
             consensus_ratio_long=consensus.get("consensus_ratio_long"),
             consensus_ratio_short=consensus.get("consensus_ratio_short"),
             average_imbalance=consensus.get("average_imbalance"),
+            median_imbalance=consensus.get("median_imbalance"),
+            raw_average_imbalance=consensus.get("raw_average_imbalance"),
+            anomalous_exchanges_count=consensus.get("anomalous_exchanges_count"),
+            excluded_anomalous_imbalance_exchanges_json=json.dumps(consensus.get("excluded_anomalous_imbalance_exchanges") or []),
             average_momentum=consensus.get("average_momentum"),
             configured_exchange_imbalance=consensus.get("configured_exchange_imbalance"),
             configured_exchange_spread=consensus.get("configured_exchange_spread"),
@@ -1368,6 +1476,10 @@ class OrderBookRecoveryService(Response):
             "min_consensus_ratio": config.min_consensus_ratio,
             "max_snapshot_age_seconds": config.max_snapshot_age_seconds,
             "require_configured_exchange_signal": config.require_configured_exchange_signal,
+            "use_median_imbalance": config.use_median_imbalance,
+            "imbalance_anomaly_min": config.imbalance_anomaly_min,
+            "imbalance_anomaly_max": config.imbalance_anomaly_max,
+            "exclude_anomalous_imbalance": config.exclude_anomalous_imbalance,
             "cooldown_after_max_recovery_seconds": config.cooldown_after_max_recovery_seconds,
             "feedback_enabled": config.feedback_enabled,
             "feedback_lookback_trades": config.feedback_lookback_trades,
@@ -1430,6 +1542,10 @@ class OrderBookRecoveryService(Response):
             "signal_consensus_ratio_long": trade.signal_consensus_ratio_long,
             "signal_consensus_ratio_short": trade.signal_consensus_ratio_short,
             "signal_average_imbalance": trade.signal_average_imbalance,
+            "signal_median_imbalance": trade.signal_median_imbalance,
+            "signal_raw_average_imbalance": trade.signal_raw_average_imbalance,
+            "signal_anomalous_exchanges_count": trade.signal_anomalous_exchanges_count,
+            "signal_excluded_anomalous_imbalance_exchanges_json": trade.signal_excluded_anomalous_imbalance_exchanges_json,
             "signal_average_momentum": trade.signal_average_momentum,
             "signal_configured_exchange_imbalance": trade.signal_configured_exchange_imbalance,
             "signal_configured_exchange_spread": trade.signal_configured_exchange_spread,
@@ -1445,6 +1561,10 @@ class OrderBookRecoveryService(Response):
             "consensus_ratio_long": trade.consensus_ratio_long,
             "consensus_ratio_short": trade.consensus_ratio_short,
             "average_imbalance": trade.average_imbalance,
+            "median_imbalance": trade.median_imbalance,
+            "raw_average_imbalance": trade.raw_average_imbalance,
+            "anomalous_exchanges_count": trade.anomalous_exchanges_count,
+            "excluded_anomalous_imbalance_exchanges_json": trade.excluded_anomalous_imbalance_exchanges_json,
             "average_momentum": trade.average_momentum,
             "configured_exchange_imbalance": trade.configured_exchange_imbalance,
             "configured_exchange_spread": trade.configured_exchange_spread,

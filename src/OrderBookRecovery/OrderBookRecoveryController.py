@@ -98,6 +98,20 @@ class OrderBookRecoveryTradeArchiveController(Controller):
         return self.service.archive_trade(trade_id, self.request.get_json() or {})
 
 
+class OrderBookRecoveryTradeDeleteArchivedController(Controller):
+    service = OrderBookRecoveryService()
+
+    def post(self, trade_id: int):
+        return self.service.delete_archived_trade(trade_id)
+
+
+class OrderBookRecoveryDeleteAllArchivedController(Controller):
+    service = OrderBookRecoveryService()
+
+    def post(self):
+        return self.service.delete_all_archived_trades()
+
+
 class OrderBookRecoveryArchiveAllClosedController(Controller):
     service = OrderBookRecoveryService()
 

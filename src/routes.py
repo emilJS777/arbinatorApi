@@ -54,7 +54,7 @@ api.add_resource(ResearchHeatmapController, "/api/research/heatmaps")
 from src.Scanner.ScannerController import ScannerDiagnosticsController
 api.add_resource(ScannerDiagnosticsController, "/api/scanner/diagnostics")
 
-from src.OrderBookRecovery.OrderBookRecoveryController import OrderBookRecoveryConfigController, OrderBookRecoveryOptionsController, OrderBookRecoveryStartController, OrderBookRecoveryStopController, OrderBookRecoveryStateController, OrderBookRecoveryTradeController, OrderBookRecoveryMetricsController, OrderBookRecoveryDebugController, OrderBookRecoveryForwardTestController, OrderBookRecoveryForwardTestItemController, OrderBookRecoveryForwardTestMetricsController, OrderBookRecoveryManualCloseController, OrderBookRecoveryTradeArchiveController, OrderBookRecoveryArchiveAllClosedController, OrderBookRecoveryUnarchiveAllController, OrderBookRecoveryTradeDecisionDetailsController, OrderBookRecoveryTradeExportController
+from src.OrderBookRecovery.OrderBookRecoveryController import OrderBookRecoveryConfigController, OrderBookRecoveryOptionsController, OrderBookRecoveryStartController, OrderBookRecoveryStopController, OrderBookRecoveryStateController, OrderBookRecoveryTradeController, OrderBookRecoveryMetricsController, OrderBookRecoveryDebugController, OrderBookRecoveryForwardTestController, OrderBookRecoveryForwardTestItemController, OrderBookRecoveryForwardTestMetricsController, OrderBookRecoveryManualCloseController, OrderBookRecoveryTradeArchiveController, OrderBookRecoveryTradeDeleteArchivedController, OrderBookRecoveryDeleteAllArchivedController, OrderBookRecoveryArchiveAllClosedController, OrderBookRecoveryUnarchiveAllController, OrderBookRecoveryTradeDecisionDetailsController, OrderBookRecoveryTradeExportController
 api.add_resource(OrderBookRecoveryConfigController, "/api/orderbook-recovery/config")
 api.add_resource(OrderBookRecoveryOptionsController, "/api/orderbook-recovery/options")
 api.add_resource(OrderBookRecoveryStartController, "/api/orderbook-recovery/start-paper")
@@ -68,6 +68,8 @@ api.add_resource(OrderBookRecoveryForwardTestItemController, "/api/orderbook-rec
 api.add_resource(OrderBookRecoveryForwardTestMetricsController, "/api/orderbook-recovery/forward-tests/<int:run_id>/metrics")
 api.add_resource(OrderBookRecoveryManualCloseController, "/api/orderbook-recovery/positions/<int:position_id>/close-manual")
 api.add_resource(OrderBookRecoveryTradeArchiveController, "/api/orderbook-recovery/trades/<int:trade_id>/archive")
+api.add_resource(OrderBookRecoveryTradeDeleteArchivedController, "/api/orderbook-recovery/trades/<int:trade_id>/delete-archived")
+api.add_resource(OrderBookRecoveryDeleteAllArchivedController, "/api/orderbook-recovery/trades/delete-all-archived")
 api.add_resource(OrderBookRecoveryArchiveAllClosedController, "/api/orderbook-recovery/trades/archive-all-closed")
 api.add_resource(OrderBookRecoveryUnarchiveAllController, "/api/orderbook-recovery/trades/unarchive-all")
 api.add_resource(OrderBookRecoveryTradeDecisionDetailsController, "/api/orderbook-recovery/trades/<int:trade_id>/decision-details")

@@ -329,6 +329,54 @@ def test_unarchive_all_restores_metrics(client):
     assert after["archived_trades_count"] == 0
 
 
+def test_delete_archived_trade(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    trade = closed_trade(config, pnl=3)
+    trade.is_archived = True
+    trade.archived_at = datetime.utcnow()
+    db.session.commit()
+
+    response = client.post(f"/api/orderbook-recovery/trades/{trade.id}/delete-archived", json={})
+
+    assert response.status_code == 200
+    assert response.get_json()["obj"]["deleted_trade_id"] == trade.id
+    assert db.session.get(StrategyRunTrade, trade.id) is None
+
+
+def test_cannot_delete_non_archived_trade(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    trade = closed_trade(config, pnl=3)
+
+    response = client.post(f"/api/orderbook-recovery/trades/{trade.id}/delete-archived", json={})
+    data = response.get_json()
+
+    assert response.status_code == 400
+    assert data["obj"]["msg"] == "cannot_delete_non_archived_trade"
+    assert db.session.get(StrategyRunTrade, trade.id) is not None
+
+
+def test_delete_all_archived_trades(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    archived_one = closed_trade(config, pnl=3)
+    archived_two = closed_trade(config, pnl=-1)
+    active = closed_trade(config, pnl=2)
+    for trade in [archived_one, archived_two]:
+        trade.is_archived = True
+        trade.archived_at = datetime.utcnow()
+    db.session.commit()
+
+    response = client.post("/api/orderbook-recovery/trades/delete-all-archived", json={})
+
+    assert response.status_code == 200
+    assert response.get_json()["obj"]["deleted_count"] == 2
+    assert db.session.get(StrategyRunTrade, archived_one.id) is None
+    assert db.session.get(StrategyRunTrade, archived_two.id) is None
+    assert db.session.get(StrategyRunTrade, active.id) is not None
+
+
 def test_recovery_doubles_after_loss(client):
     service = OrderBookRecoveryService()
     config = make_config(service)
@@ -675,6 +723,132 @@ def test_consensus_high_spread_exchange_ignored(client):
     assert consensus["per_exchange_features"][0]["reject_reason"] == "spread_too_high"
 
 
+def test_imbalance_above_anomaly_max_excluded_from_consensus(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    db.session.commit()
+    prime_momentum(service, config, "Mexc")
+    add_snapshot("Mexc", bid_amount=10, ask_amount=0.5)
+
+    consensus = service.consensus_snapshot(config)
+    row = consensus["per_exchange_features"][0]
+
+    assert row["is_imbalance_anomaly"] is True
+    assert row["reject_reason"] == "imbalance_anomaly"
+    assert consensus["valid_exchanges_count"] == 0
+    assert consensus["confirming_long_count"] == 0
+
+
+def test_imbalance_below_anomaly_min_excluded_from_consensus(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    db.session.commit()
+    prime_momentum(service, config, "Mexc")
+    add_snapshot("Mexc", bid_amount=1, ask_amount=20)
+
+    consensus = service.consensus_snapshot(config)
+    row = consensus["per_exchange_features"][0]
+
+    assert row["is_imbalance_anomaly"] is True
+    assert row["reject_reason"] == "imbalance_anomaly"
+    assert consensus["valid_exchanges_count"] == 0
+
+
+def test_median_imbalance_calculated_from_valid_non_anomalous_exchanges(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.require_configured_exchange_signal = False
+    db.session.commit()
+    for exchange, bid_amount, ask_amount in [
+        ("Mexc", 10, 5),
+        ("Binance", 15, 5),
+        ("Bybit", 5, 5),
+        ("Gate", 10, 0.5),
+    ]:
+        prime_momentum(service, config, exchange)
+        add_snapshot(exchange, bid_amount=bid_amount, ask_amount=ask_amount)
+
+    consensus = service.consensus_snapshot(config)
+
+    assert consensus["valid_exchanges_count"] == 3
+    assert consensus["anomalous_exchanges_count"] == 1
+    assert consensus["median_imbalance"] == 2
+    assert "Gate:TON/USDT" in consensus["excluded_anomalous_imbalance_exchanges"]
+
+
+def test_decision_uses_median_imbalance_not_raw_average(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.min_confirming_exchanges = 1
+    config.min_consensus_ratio = 0.3
+    config.require_configured_exchange_signal = False
+    config.exclude_anomalous_imbalance = False
+    db.session.commit()
+    for exchange, bid_amount, ask_amount in [
+        ("Mexc", 11, 10),
+        ("Binance", 11, 10),
+        ("Bybit", 100, 1),
+    ]:
+        prime_momentum(service, config, exchange)
+        add_snapshot(exchange, bid_amount=bid_amount, ask_amount=ask_amount)
+
+    result = service.evaluate(config)
+    consensus = service.last_evaluation_for(config)["consensus"]
+
+    assert result is None
+    assert consensus["raw_average_imbalance"] > config.long_imbalance_threshold
+    assert consensus["median_imbalance"] < config.long_imbalance_threshold
+    assert consensus["reject_reason"] == "no_consensus"
+    assert StrategyRunTrade.query.count() == 0
+
+
+def test_all_anomalous_imbalances_do_not_open_trade(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    db.session.commit()
+    for exchange in ["Mexc", "Binance", "Bybit"]:
+        prime_momentum(service, config, exchange)
+        add_snapshot(exchange, bid_amount=100, ask_amount=1)
+
+    result = service.evaluate(config)
+    consensus = service.last_evaluation_for(config)["consensus"]
+
+    assert result is None
+    assert consensus["valid_exchanges_count"] == 0
+    assert consensus["median_imbalance"] is None
+    assert StrategyRunTrade.query.count() == 0
+
+
+def test_debug_returns_imbalance_anomaly_fields(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    db.session.commit()
+    for exchange in ["Mexc", "Binance", "Bybit"]:
+        prime_momentum(service, config, exchange)
+        add_snapshot(exchange, bid_amount=10, ask_amount=5)
+    add_snapshot("Gate", bid_amount=100, ask_amount=1)
+
+    response = client.get("/api/orderbook-recovery/debug")
+    payload = response.get_json()["obj"]
+
+    assert "median_imbalance" in payload
+    assert "raw_average_imbalance" in payload
+    assert payload["anomalous_exchanges_count"] == 1
+    assert payload["per_exchange_features"][0]["raw_imbalance"] is not None
+
+
 def test_consensus_configured_exchange_remains_execution_venue(client):
     service = OrderBookRecoveryService()
     config = make_config(service)
@@ -848,6 +1022,10 @@ def test_export_csv_includes_decision_snapshot_fields(client):
     assert "decision_snapshot_json" in row
     assert "per_exchange_features_json" in row
     assert "consensus_direction" in row
+    assert "median_imbalance" in row
+    assert "raw_average_imbalance" in row
+    assert "anomalous_exchanges_count" in row
+    assert "excluded_anomalous_imbalance_exchanges" in row
     assert json.loads(row["decision_snapshot_json"])["selected_side"] == "long"
 
 
@@ -1358,8 +1536,17 @@ def test_frontend_archive_controls_exist():
     assert "Show archived trades" in frontend_view
     assert "Archive all closed trades" in frontend_view
     assert "Unarchive all" in frontend_view
+    assert "Delete archived trade permanently?" in frontend_view
+    assert "Delete all archived trades" in frontend_view
+    assert "Delete all archived trades permanently?" in frontend_view
+    assert "DELETE_ARCHIVED_TRADE" in frontend_view
+    assert "DELETE_ALL_ARCHIVED_TRADES" in frontend_view
     assert "archive-all-closed" in frontend_api
     assert "unarchive-all" in frontend_api
+    assert "delete-archived" in frontend_api
+    assert "delete-all-archived" in frontend_api
+    assert "deleteArchivedTrade" in frontend_api
+    assert "deleteAllArchivedTrades" in frontend_api
     assert "include_archived" in frontend_api
 
 

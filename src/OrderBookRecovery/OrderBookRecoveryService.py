@@ -40,6 +40,7 @@ class OrderBookRecoveryService(Response):
     _last_mismatch_hooks = {}
     _pending_entries = {}
     _last_confirmation_results = {}
+    _live_market_infos = {}
 
     def __init__(self, publisher=None, live_execution_service=None):
         self.publisher = publisher or EventPublisher()
@@ -266,20 +267,19 @@ class OrderBookRecoveryService(Response):
         try:
             client = self.live_execution_service.client(config)
             market = self.live_execution_service.market(client, config.symbol)
-            logger.info("OrderBookRecovery live startup market resolved: %s", self.live_execution_service.market_info(market, configured_symbol=config.symbol))
+            market_info = self.live_execution_service.market_info(market, configured_symbol=config.symbol)
+            self.__class__._live_market_infos[self.debug_key(config)] = market_info
+            logger.info("OrderBookRecovery live startup market resolved: %s", market_info)
         except Exception as error:
+            self.__class__._live_market_infos[self.debug_key(config)] = self.live_execution_service.market_info(error=str(error), configured_symbol=config.symbol)
             return str(error)
         return None
 
     def live_market_debug(self, config):
-        if config.execution_mode != "live":
-            return self.live_execution_service.market_info(configured_symbol=config.symbol)
-        try:
-            client = self.live_execution_service.client(config)
-            market = self.live_execution_service.market(client, config.symbol)
-            return self.live_execution_service.market_info(market, configured_symbol=config.symbol)
-        except Exception as error:
-            return self.live_execution_service.market_info(error=str(error), configured_symbol=config.symbol)
+        return self.__class__._live_market_infos.get(
+            self.debug_key(config),
+            self.live_execution_service.market_info(configured_symbol=config.symbol),
+        )
 
     def stop(self, reason="manual_stop"):
         config = self.get_or_create_config()
@@ -378,6 +378,8 @@ class OrderBookRecoveryService(Response):
                 except Exception as error:
                     db.session.rollback()
                     logger.warning("Forward test auto-stop failed for run %s: %s", run_id, error)
+                finally:
+                    db.session.remove()
 
         Thread(target=worker, daemon=True).start()
 

@@ -1732,10 +1732,7 @@ def test_mexc_client_uses_swap_options(client):
 
 
 def test_debug_returns_live_market_fields(client):
-    mock_client = MockLiveClient(markets={
-        "BTC/USDT:USDT": {"symbol": "BTC/USDT:USDT", "swap": True, "linear": True, "base": "BTC", "quote": "USDT", "settle": "USDT", "type": "swap"},
-    })
-    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client))
+    service = OrderBookRecoveryService()
     config = make_config(service)
     exchange = seed_live_exchange("Mexc")
     config.exchange = "Mexc"
@@ -1743,6 +1740,13 @@ def test_debug_returns_live_market_fields(client):
     config.symbol = "BTC/USDT"
     config.execution_mode = "live"
     db.session.commit()
+    OrderBookRecoveryService._live_market_infos[service.debug_key(config)] = {
+        "configured_symbol": "BTC/USDT",
+        "resolved_live_symbol": "BTC/USDT:USDT",
+        "live_market_type": "swap",
+        "live_market_valid": True,
+        "live_market_error": None,
+    }
 
     debug = service.debug_payload(config, service.get_or_create_state(config))
 

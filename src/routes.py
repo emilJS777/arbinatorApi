@@ -1,5 +1,9 @@
 from src import api
 
+from src.Health.HealthController import HealthController, ReadinessController
+api.add_resource(HealthController, "/healthz")
+api.add_resource(ReadinessController, "/readyz")
+
 from src.Exchange.ExchangeController import ExchangeController
 api.add_resource(ExchangeController, "/api/exchange")
 

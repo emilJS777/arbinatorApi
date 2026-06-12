@@ -8,10 +8,11 @@ from src.OrderBookRecovery.LiveExecutionService import LiveExecutionService
 
 
 class FakeResponse:
-    def __init__(self, status_code=200, text="ok"):
+    def __init__(self, status_code=200, text="ok", headers=None):
         self.status_code = status_code
         self.text = text
         self.ok = 200 <= status_code < 300
+        self.headers = headers or {}
 
     def json(self):
         return json.loads(self.text)
@@ -38,8 +39,10 @@ class FakeRequests:
 
 
 class FakeOrderSubmitRequests:
-    def __init__(self):
+    def __init__(self, submit_status=200, submit_text='{"code":200,"data":"dry-real-order-id"}'):
         self.calls = []
+        self.submit_status = submit_status
+        self.submit_text = submit_text
 
     def request(self, method, url, headers=None, data=None, timeout=None):
         self.calls.append({
@@ -49,7 +52,11 @@ class FakeOrderSubmitRequests:
             "data": data,
             "timeout": timeout,
         })
-        return FakeResponse(200, '{"code":200,"data":"dry-real-order-id"}')
+        return FakeResponse(self.submit_status, self.submit_text, headers={
+            "Content-Type": "application/json",
+            "x-cache": "AkamaiGHost",
+            "akamai-request-id": "abc",
+        })
 
     def get(self, url, params=None, timeout=None):
         self.calls.append({
@@ -221,6 +228,12 @@ def test_mexc_order_submit_drycheck_builds_expected_body_and_does_not_send(clien
     assert payload["body"]["type"] == 5
     assert payload["body"]["openType"] == 1
     assert payload["body"]["leverage"] == 1
+    assert set(payload["available_submit_formats"]) == {"ccxt_json", "json_no_source", "json_user_agent", "form_urlencoded", "form_urlencoded_no_source", "ccxt_raw_request"}
+    assert payload["submit_format_requests"]["ccxt_json"]["content_type"] == "application/json"
+    assert payload["submit_format_requests"]["json_no_source"]["headers_names_used"] == ["ApiKey", "Content-Type", "Request-Time", "Signature"]
+    assert "User-Agent" in payload["submit_format_requests"]["json_user_agent"]["headers_names_used"]
+    assert payload["submit_format_requests"]["form_urlencoded"]["content_type"] == "application/x-www-form-urlencoded"
+    assert "symbol=BTC_USDT" in payload["submit_format_requests"]["form_urlencoded"]["serialized_body"]
     assert payload["contract_detail"]["contractSize"] == 0.001
     assert payload["volume_details"]["raw_vol"] == 10
     assert payload["volume_details"]["rounded_vol"] == 10
@@ -259,6 +272,7 @@ def test_mexc_order_submit_signature_payload_matches_sent_body(client):
 
     payload = service.run({
         "confirm_real_order_test": True,
+        "submit_format": "ccxt_json",
         "symbol": "BTC/USDT",
         "margin_usdt": 1,
         "leverage": 1,
@@ -274,6 +288,35 @@ def test_mexc_order_submit_signature_payload_matches_sent_body(client):
     assert sent["data"] == payload["serialized_body"]
     assert payload["signature_payload_preview"].endswith(payload["serialized_body"])
     assert set(payload["headers_names_used"]) == {"ApiKey", "Content-Type", "Request-Time", "Signature", "source"}
+    assert payload["real_order_status_code"] == 200
+    assert payload["real_order_response_headers"]["akamai_headers"]["x-cache"] == "AkamaiGHost"
+    assert payload["real_order_request"]["serialized_body"] == payload["serialized_body"]
+
+
+def test_mexc_order_submit_real_test_reports_403_headers(client):
+    seed_mexc()
+    requests_client = FakeOrderSubmitRequests(submit_status=403, submit_text="Access Denied")
+    service = MexcOrderSubmitDryCheckService(
+        live_execution_service=LiveExecutionService(client_factory=lambda _exchange: FakeMexcClient({"apiKey": "api-key-value", "secret": "secret-value"}), requests_client=requests_client)
+    )
+
+    response = service.run({
+        "confirm_real_order_test": True,
+        "submit_format": "json_user_agent",
+        "symbol": "BTC/USDT",
+        "margin_usdt": 1,
+        "leverage": 1,
+        "side": "long",
+        "price": 100,
+    })
+    payload = response.get_json()["obj"]
+
+    assert response.status_code == 400
+    assert payload["real_order_status_code"] == 403
+    assert payload["real_order_response_preview"] == "Access Denied"
+    assert payload["real_order_submit_format"] == "json_user_agent"
+    assert "User-Agent" in payload["real_order_request"]["headers_names_used"]
+    assert payload["real_order_response_headers"]["akamai_headers"]["akamai-request-id"] == "abc"
 
 
 def test_mexc_order_submit_drycheck_route(client, monkeypatch):

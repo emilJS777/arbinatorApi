@@ -241,6 +241,12 @@ def test_mexc_order_submit_drycheck_builds_expected_body_and_does_not_send(clien
         "json_type6_integer_vol",
         "form_urlencoded_type6",
         "json_type6_user_agent",
+        "json_new_base_order_submit_type6",
+        "json_new_base_order_create_type6",
+        "json_old_base_order_create_type6",
+        "json_new_base_order_place_type6",
+        "json_new_base_submit_batch_type6",
+        "json_new_base_planorder_place_v2_type6",
         "json_no_source",
         "json_user_agent",
         "form_urlencoded",
@@ -273,6 +279,19 @@ def test_mexc_order_submit_drycheck_builds_expected_body_and_does_not_send(clien
     assert "type=6" in payload["submit_format_requests"]["form_urlencoded_type6"]["serialized_body"]
     assert payload["submit_format_requests"]["json_type6_user_agent"]["body"]["type"] == 6
     assert payload["submit_format_requests"]["json_type6_user_agent"]["user_agent_used"].startswith("Mozilla/5.0")
+    assert payload["submit_format_requests"]["json_new_base_order_submit_type6"]["endpoint"] == "https://api.mexc.com/api/v1/private/order/submit"
+    assert payload["submit_format_requests"]["json_new_base_order_submit_type6"]["endpoint_path"] == "order/submit"
+    assert payload["submit_format_requests"]["json_new_base_order_submit_type6"]["base_url_family"] == "latest_ccxt_api_mexc_contract_private"
+    assert payload["submit_format_requests"]["json_new_base_order_create_type6"]["endpoint"] == "https://api.mexc.com/api/v1/private/order/create"
+    assert payload["submit_format_requests"]["json_new_base_order_create_type6"]["endpoint_path"] == "order/create"
+    assert payload["submit_format_requests"]["json_new_base_order_create_type6"]["body"]["type"] == 6
+    assert "price" not in payload["submit_format_requests"]["json_new_base_order_create_type6"]["body"]
+    assert payload["submit_format_requests"]["json_old_base_order_create_type6"]["endpoint"] == "https://contract.mexc.com/api/v1/private/order/create"
+    assert payload["submit_format_requests"]["json_new_base_order_place_type6"]["endpoint_path"] == "order/place"
+    assert payload["submit_format_requests"]["json_new_base_submit_batch_type6"]["endpoint"] == "https://api.mexc.com/api/v1/private/order/submit_batch"
+    assert isinstance(payload["submit_format_requests"]["json_new_base_submit_batch_type6"]["body"], list)
+    assert payload["submit_format_requests"]["json_new_base_submit_batch_type6"]["body"][0]["type"] == 6
+    assert payload["submit_format_requests"]["json_new_base_planorder_place_v2_type6"]["endpoint"] == "https://api.mexc.com/api/v1/private/planorder/place/v2"
     assert payload["submit_format_requests"]["json_no_source"]["headers_names_used"] == ["ApiKey", "Content-Type", "Request-Time", "Signature"]
     assert "User-Agent" in payload["submit_format_requests"]["json_user_agent"]["headers_names_used"]
     assert payload["submit_format_requests"]["json_user_agent"]["user_agent_used"].startswith("Mozilla/5.0")
@@ -287,6 +306,9 @@ def test_mexc_order_submit_drycheck_builds_expected_body_and_does_not_send(clien
     assert payload["order_type_mapping"]["mexc_type"] == 5
     assert payload["api_format_notes"]["mexc_docs_market_order_type"] == 5
     assert payload["api_format_notes"]["ccxt_mexc_swap_market_order_type"] == 6
+    assert payload["api_format_notes"]["latest_ccxt_contract_private_base"] == "https://api.mexc.com/api/v1/private"
+    assert payload["api_format_notes"]["installed_ccxt_contract_private_base"] == "https://contract.mexc.com/api/v1/private"
+    assert "order/create" in payload["api_format_notes"]["latest_ccxt_observed_trade_paths"]
     assert payload["side_mapping"]["mexc_side"] == 1
     assert "api-key-value" not in str(payload)
     assert "secret-value" not in str(payload)
@@ -466,6 +488,58 @@ def test_mexc_order_submit_type6_form_urlencoded_sends_exact_variant(client):
     assert sent["data"] == payload["real_order_request"]["serialized_body"]
     assert "type=6" in sent["data"]
     assert payload["real_order_request"]["signature_payload_preview"].endswith(sent["data"])
+
+
+def test_mexc_order_submit_new_base_order_create_sends_exact_variant(client):
+    seed_mexc()
+    requests_client = FakeOrderSubmitRequests()
+    service = MexcOrderSubmitDryCheckService(
+        live_execution_service=LiveExecutionService(client_factory=lambda _exchange: FakeMexcClient({"apiKey": "api-key-value", "secret": "secret-value"}), requests_client=requests_client)
+    )
+
+    payload = service.run({
+        "confirm_real_order_test": True,
+        "submit_format": "json_new_base_order_create_type6",
+        "symbol": "BTC/USDT",
+        "margin_usdt": 1,
+        "leverage": 1,
+        "side": "long",
+        "price": 100,
+    }).get_json()["obj"]
+
+    sent = requests_client.calls[1]
+    assert payload["real_order_submit_format"] == "json_new_base_order_create_type6"
+    assert sent["url"] == "https://api.mexc.com/api/v1/private/order/create"
+    assert payload["real_order_request"]["endpoint_path"] == "order/create"
+    assert payload["real_order_request"]["base_url_family"] == "latest_ccxt_api_mexc_contract_private"
+    assert payload["real_order_request"]["body"]["type"] == 6
+    assert "price" not in payload["real_order_request"]["body"]
+    assert sent["data"] == payload["real_order_request"]["serialized_body"]
+
+
+def test_mexc_order_submit_batch_new_base_uses_array_body(client):
+    seed_mexc()
+    requests_client = FakeOrderSubmitRequests()
+    service = MexcOrderSubmitDryCheckService(
+        live_execution_service=LiveExecutionService(client_factory=lambda _exchange: FakeMexcClient({"apiKey": "api-key-value", "secret": "secret-value"}), requests_client=requests_client)
+    )
+
+    payload = service.run({
+        "confirm_real_order_test": True,
+        "submit_format": "json_new_base_submit_batch_type6",
+        "symbol": "BTC/USDT",
+        "margin_usdt": 1,
+        "leverage": 1,
+        "side": "long",
+        "price": 100,
+    }).get_json()["obj"]
+
+    sent = requests_client.calls[1]
+    assert payload["real_order_submit_format"] == "json_new_base_submit_batch_type6"
+    assert sent["url"] == "https://api.mexc.com/api/v1/private/order/submit_batch"
+    assert isinstance(payload["real_order_request"]["body"], list)
+    assert sent["data"].startswith("[")
+    assert '"type":6' in sent["data"]
 
 
 def test_mexc_order_submit_drycheck_route(client, monkeypatch):

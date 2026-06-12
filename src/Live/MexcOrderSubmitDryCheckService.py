@@ -25,6 +25,12 @@ class MexcOrderSubmitDryCheckService(Response):
         "json_type6_integer_vol",
         "form_urlencoded_type6",
         "json_type6_user_agent",
+        "json_new_base_order_submit_type6",
+        "json_new_base_order_create_type6",
+        "json_old_base_order_create_type6",
+        "json_new_base_order_place_type6",
+        "json_new_base_submit_batch_type6",
+        "json_new_base_planorder_place_v2_type6",
         "json_no_source",
         "json_user_agent",
         "form_urlencoded",
@@ -143,8 +149,18 @@ class MexcOrderSubmitDryCheckService(Response):
         next_body["type"] = order_type
         return next_body
 
-    def direct_signed_request(self, client, body, content_type="application/json", include_source=True, user_agent=None):
-        signed = client.sign("order/submit", api=["contract", "private"], method="POST", params=body)
+    def direct_signed_request(
+        self,
+        client,
+        body,
+        content_type="application/json",
+        include_source=True,
+        user_agent=None,
+        path="order/submit",
+        endpoint_base_url=None,
+        base_url_family=None,
+    ):
+        signed = client.sign(path, api=["contract", "private"], method="POST", params=body)
         headers = dict(signed.get("headers") or {})
         if not include_source:
             headers.pop("source", None)
@@ -160,8 +176,11 @@ class MexcOrderSubmitDryCheckService(Response):
         else:
             serialized_body = signed.get("body")
             headers["Content-Type"] = "application/json"
+        endpoint = signed["url"]
+        if endpoint_base_url:
+            endpoint = endpoint_base_url.rstrip("/") + "/" + path
         return {
-            "endpoint": signed["url"],
+            "endpoint": endpoint,
             "method": signed.get("method") or "POST",
             "headers": headers,
             "body": body,
@@ -169,12 +188,17 @@ class MexcOrderSubmitDryCheckService(Response):
             "signature_payload_preview": f"ApiKey + Request-Time + {serialized_body}",
             "request_time": headers.get("Request-Time"),
             "content_type": headers.get("Content-Type"),
+            "endpoint_path": path,
+            "base_url_family": base_url_family or "installed_ccxt_contract_private",
         }
 
     def alternative_submit_requests(self, client, signed, current_market_price=None):
         body = signed["body"]
         integer_body = self.integerize_order_body(body)
         current_price_body = self.body_with_price(integer_body, current_market_price) if current_market_price else integer_body
+        type6_body = self.body_with_type(integer_body, 6)
+        new_contract_private_base = "https://api.mexc.com/api/v1/private"
+        old_contract_private_base = "https://contract.mexc.com/api/v1/private"
         browser_user_agent = (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -188,11 +212,11 @@ class MexcOrderSubmitDryCheckService(Response):
             "json_integer_vol": self.direct_signed_request(client, integer_body),
             "json_type6_price_omitted": self.direct_signed_request(
                 client,
-                self.body_without_price(self.body_with_type(integer_body, 6)),
+                self.body_without_price(type6_body),
             ),
             "json_type6_price_zero": self.direct_signed_request(
                 client,
-                self.body_with_price(self.body_with_type(integer_body, 6), 0),
+                self.body_with_price(type6_body, 0),
             ),
             "json_type6_price_current": self.direct_signed_request(
                 client,
@@ -200,17 +224,59 @@ class MexcOrderSubmitDryCheckService(Response):
             ),
             "json_type6_integer_vol": self.direct_signed_request(
                 client,
-                self.body_with_type(integer_body, 6),
+                type6_body,
             ),
             "form_urlencoded_type6": self.direct_signed_request(
                 client,
-                self.body_with_type(integer_body, 6),
+                type6_body,
                 content_type="application/x-www-form-urlencoded",
             ),
             "json_type6_user_agent": self.direct_signed_request(
                 client,
-                self.body_with_type(integer_body, 6),
+                type6_body,
                 user_agent=browser_user_agent,
+            ),
+            "json_new_base_order_submit_type6": self.direct_signed_request(
+                client,
+                self.body_without_price(type6_body),
+                path="order/submit",
+                endpoint_base_url=new_contract_private_base,
+                base_url_family="latest_ccxt_api_mexc_contract_private",
+            ),
+            "json_new_base_order_create_type6": self.direct_signed_request(
+                client,
+                self.body_without_price(type6_body),
+                path="order/create",
+                endpoint_base_url=new_contract_private_base,
+                base_url_family="latest_ccxt_api_mexc_contract_private",
+            ),
+            "json_old_base_order_create_type6": self.direct_signed_request(
+                client,
+                self.body_without_price(type6_body),
+                path="order/create",
+                endpoint_base_url=old_contract_private_base,
+                base_url_family="legacy_contract_mexc_private",
+            ),
+            "json_new_base_order_place_type6": self.direct_signed_request(
+                client,
+                self.body_without_price(type6_body),
+                path="order/place",
+                endpoint_base_url=new_contract_private_base,
+                base_url_family="latest_ccxt_api_mexc_contract_private",
+            ),
+            "json_new_base_submit_batch_type6": self.direct_signed_request(
+                client,
+                [self.body_without_price(type6_body)],
+                path="order/submit_batch",
+                endpoint_base_url=new_contract_private_base,
+                base_url_family="latest_ccxt_api_mexc_contract_private",
+            ),
+            "json_new_base_planorder_place_v2_type6": self.direct_signed_request(
+                client,
+                self.body_without_price(type6_body),
+                path="planorder/place/v2",
+                endpoint_base_url=new_contract_private_base,
+                base_url_family="latest_ccxt_api_mexc_contract_private",
             ),
             "ccxt_raw_request": signed,
             "json_no_source": self.direct_signed_request(client, body, include_source=False),
@@ -232,6 +298,8 @@ class MexcOrderSubmitDryCheckService(Response):
                 "signature_payload_preview": item["signature_payload_preview"],
                 "source_header_used": "source" in (item.get("headers") or {}),
                 "user_agent_used": (item.get("headers") or {}).get("User-Agent"),
+                "endpoint_path": item.get("endpoint_path"),
+                "base_url_family": item.get("base_url_family"),
             }
         return variants, sanitized
 
@@ -293,6 +361,14 @@ class MexcOrderSubmitDryCheckService(Response):
                     "ccxt_mexc_swap_market_order_type": 6,
                     "market_price_variants": ["price omitted", "price=0", "price=current mark/last/current"],
                     "type6_hypothesis": "ccxt maps MEXC swap market orders to type=6 (convert market price to current price)",
+                    "latest_ccxt_contract_private_base": "https://api.mexc.com/api/v1/private",
+                    "installed_ccxt_contract_private_base": "https://contract.mexc.com/api/v1/private",
+                    "latest_ccxt_observed_trade_paths": [
+                        "order/create",
+                        "order/submit",
+                        "order/submit_batch",
+                        "planorder/place/v2",
+                    ],
                     "volume_format": "diagnostics include integer contract vol when integral",
                     "side_values": {
                         "open_long": 1,

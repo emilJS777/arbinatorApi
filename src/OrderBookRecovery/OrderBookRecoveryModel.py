@@ -9,6 +9,8 @@ class OrderBookPatternStrategyConfig(Model, db.Model):
 
     exchange = db.Column(db.String(80), default="binance", nullable=False)
     symbol = db.Column(db.String(40), default="BTC/USDT", nullable=False)
+    exchange_id = db.Column(db.Integer, db.ForeignKey("exchange.id"), nullable=True)
+    trading_pair_id = db.Column(db.Integer, db.ForeignKey("trading_pair.id"), nullable=True)
     base_margin_usdt = db.Column(db.Float, default=7, nullable=False)
     leverage = db.Column(db.Float, default=2, nullable=False)
     max_recovery_steps = db.Column(db.Integer, default=2, nullable=False)

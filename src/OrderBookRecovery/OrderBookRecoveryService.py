@@ -7,10 +7,11 @@ import json
 import logging
 import time
 
-from flask import send_file
+from flask import jsonify, make_response, send_file
 
 from src import db
 from src.Arbitrage.OrderBookSnapshotStore import OrderBookSnapshotStore
+from src.Exchange.ExchangeModel import Exchange
 from src.OrderBookRecovery.OrderBookRecoveryModel import (
     OrderBookPatternStrategyConfig,
     RecoveryState,
@@ -19,6 +20,7 @@ from src.OrderBookRecovery.OrderBookRecoveryModel import (
 )
 from src.OrderBookRecovery.OrderBookNormalizer import OrderBookNormalizer
 from src.OrderBookRecovery.SignalFeedbackService import SignalFeedbackService
+from src.TradingPair.TradingPairModel import TradingPair
 from src.Socket.EventPublisher import EventPublisher
 from src.__Parents.Response import Response
 
@@ -64,6 +66,56 @@ class OrderBookRecoveryService(Response):
     def config_response(self):
         return self.response_ok(self.config_to_dict(self.get_or_create_config()))
 
+    def options_response(self):
+        exchanges = Exchange.query.filter_by(enabled=True).order_by(Exchange.index.asc()).all()
+        payload = []
+        for exchange in exchanges:
+            pairs = (
+                TradingPair.query
+                .filter_by(exchange_id=exchange.id, enabled=True)
+                .order_by(TradingPair.index.asc())
+                .all()
+            )
+            payload.append({
+                "id": exchange.id,
+                "title": exchange.title,
+                "name": exchange.title,
+                "is_active": bool(exchange.enabled),
+                "pairs": [
+                    {
+                        "id": pair.id,
+                        "pair": pair.pair,
+                        "normalized_symbol": self.normalize_symbol(pair.pair),
+                        "is_active": bool(pair.enabled),
+                    }
+                    for pair in pairs
+                ],
+            })
+        return self.response_ok({"exchanges": payload})
+
+    def validation_error(self, code: str):
+        return make_response(jsonify(success=False, obj={"msg": code, "code": code}), 400)
+
+    def resolve_config_selection(self, body: dict):
+        exchange_id = body.get("exchange_id")
+        trading_pair_id = body.get("trading_pair_id")
+        if exchange_id in (None, "") and trading_pair_id in (None, ""):
+            return None, None, None
+        if exchange_id in (None, "") or trading_pair_id in (None, ""):
+            return None, None, "invalid_pair_for_exchange"
+        try:
+            exchange_id = int(exchange_id)
+            trading_pair_id = int(trading_pair_id)
+        except (TypeError, ValueError):
+            return None, None, "invalid_pair_for_exchange"
+        exchange = Exchange.query.filter_by(id=exchange_id, enabled=True).first()
+        if not exchange:
+            return None, None, "invalid_exchange"
+        trading_pair = TradingPair.query.filter_by(id=trading_pair_id, exchange_id=exchange.id, enabled=True).first()
+        if not trading_pair:
+            return exchange, None, "invalid_pair_for_exchange"
+        return exchange, trading_pair, None
+
     def apply_config_overrides(self, config, overrides: dict):
         allowed = {
             "exchange",
@@ -106,7 +158,15 @@ class OrderBookRecoveryService(Response):
 
     def update_config(self, body: dict):
         config = self.get_or_create_config()
+        exchange, trading_pair, error = self.resolve_config_selection(body)
+        if error:
+            return self.validation_error(error)
         self.apply_config_overrides(config, body)
+        if exchange and trading_pair:
+            config.exchange_id = exchange.id
+            config.trading_pair_id = trading_pair.id
+            config.exchange = exchange.title
+            config.symbol = trading_pair.pair
         if "enabled" in body:
             config.enabled = body["enabled"]
         config.paper_mode_only = True
@@ -1263,6 +1323,8 @@ class OrderBookRecoveryService(Response):
             "enabled": config.enabled,
             "exchange": config.exchange,
             "symbol": config.symbol,
+            "exchange_id": config.exchange_id,
+            "trading_pair_id": config.trading_pair_id,
             "open_position": self.trade_to_dict(self.open_trade(config)) if self.open_trade(config) else None,
             "last_evaluation": self.last_evaluation_for(config),
             "latest_snapshot": self.latest_snapshot_for(config),
@@ -1281,6 +1343,8 @@ class OrderBookRecoveryService(Response):
             "id": config.id,
             "exchange": config.exchange,
             "symbol": config.symbol,
+            "exchange_id": config.exchange_id,
+            "trading_pair_id": config.trading_pair_id,
             "base_margin_usdt": config.base_margin_usdt,
             "leverage": config.leverage,
             "max_recovery_steps": config.max_recovery_steps,

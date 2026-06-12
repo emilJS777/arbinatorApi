@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 class MexcOrderSubmitDryCheckService(Response):
     ORDER_SUBMIT_FORMATS = [
         "ccxt_json",
+        "json_price_omitted",
+        "json_price_zero",
+        "json_price_current",
+        "json_integer_vol",
         "json_no_source",
         "json_user_agent",
         "form_urlencoded",
@@ -68,6 +72,12 @@ class MexcOrderSubmitDryCheckService(Response):
         margin = float(body.get("margin_usdt", 1))
         leverage = int(body.get("leverage", 1))
         price = float(body.get("price", body.get("current_price", 100)))
+        current_market_price = float(
+            body.get(
+                "current_mark_price",
+                body.get("mark_price", body.get("last_price", body.get("current_price", price))),
+            )
+        )
         side = body.get("side", "long")
         order_type = body.get("order_type", "market")
         symbol = body.get("symbol", "BTC/USDT")
@@ -88,6 +98,7 @@ class MexcOrderSubmitDryCheckService(Response):
             "margin": margin,
             "leverage": leverage,
             "price": price,
+            "current_market_price": current_market_price,
             "notional": notional,
             "amount": amount,
         }
@@ -102,6 +113,24 @@ class MexcOrderSubmitDryCheckService(Response):
             "akamai_headers": {key: value for key, value in headers.items() if "akamai" in key.lower() or key.lower().startswith("x-")},
             "content_type": headers.get("Content-Type") or headers.get("content-type"),
         }
+
+    def integerize_order_body(self, body):
+        next_body = dict(body)
+        for key in ("vol", "type", "openType", "side", "leverage", "price"):
+            value = next_body.get(key)
+            if isinstance(value, float) and value.is_integer():
+                next_body[key] = int(value)
+        return next_body
+
+    def body_without_price(self, body):
+        next_body = dict(body)
+        next_body.pop("price", None)
+        return next_body
+
+    def body_with_price(self, body, price):
+        next_body = dict(body)
+        next_body["price"] = price
+        return next_body
 
     def direct_signed_request(self, client, body, content_type="application/json", include_source=True, user_agent=None):
         signed = client.sign("order/submit", api=["contract", "private"], method="POST", params=body)
@@ -131,15 +160,26 @@ class MexcOrderSubmitDryCheckService(Response):
             "content_type": headers.get("Content-Type"),
         }
 
-    def alternative_submit_requests(self, client, signed):
+    def alternative_submit_requests(self, client, signed, current_market_price=None):
         body = signed["body"]
+        integer_body = self.integerize_order_body(body)
+        current_price_body = self.body_with_price(integer_body, current_market_price) if current_market_price else integer_body
+        browser_user_agent = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0.0.0 Safari/537.36"
+        )
         variants = {
             "ccxt_json": signed,
+            "json_price_omitted": self.direct_signed_request(client, self.body_without_price(integer_body)),
+            "json_price_zero": self.direct_signed_request(client, self.body_with_price(integer_body, 0)),
+            "json_price_current": self.direct_signed_request(client, current_price_body),
+            "json_integer_vol": self.direct_signed_request(client, integer_body),
             "ccxt_raw_request": signed,
             "json_no_source": self.direct_signed_request(client, body, include_source=False),
-            "json_user_agent": self.direct_signed_request(client, body, user_agent="ArbiNator-MEXC-Diagnostics/1.0"),
-            "form_urlencoded": self.direct_signed_request(client, body, content_type="application/x-www-form-urlencoded"),
-            "form_urlencoded_no_source": self.direct_signed_request(client, body, content_type="application/x-www-form-urlencoded", include_source=False),
+            "json_user_agent": self.direct_signed_request(client, integer_body, user_agent=browser_user_agent),
+            "form_urlencoded": self.direct_signed_request(client, integer_body, content_type="application/x-www-form-urlencoded"),
+            "form_urlencoded_no_source": self.direct_signed_request(client, integer_body, content_type="application/x-www-form-urlencoded", include_source=False),
         }
         sanitized = {}
         for name, item in variants.items():
@@ -153,6 +193,8 @@ class MexcOrderSubmitDryCheckService(Response):
                 "content_type": (item.get("headers") or {}).get("Content-Type"),
                 "request_time": (item.get("headers") or {}).get("Request-Time"),
                 "signature_payload_preview": item["signature_payload_preview"],
+                "source_header_used": "source" in (item.get("headers") or {}),
+                "user_agent_used": (item.get("headers") or {}).get("User-Agent"),
             }
         return variants, sanitized
 
@@ -187,7 +229,11 @@ class MexcOrderSubmitDryCheckService(Response):
                 contract_detail=contract_detail,
             )
             payload = self.live_execution_service.sanitize_signed_order_request(signed)
-            variants, sanitized_variants = self.alternative_submit_requests(client, signed)
+            variants, sanitized_variants = self.alternative_submit_requests(
+                client,
+                signed,
+                current_market_price=inputs["current_market_price"],
+            )
             payload.update({
                 "dry_run": not bool(body.get("confirm_real_order_test")),
                 "confirm_real_order_test": bool(body.get("confirm_real_order_test")),
@@ -198,11 +244,17 @@ class MexcOrderSubmitDryCheckService(Response):
                 "leverage": inputs["leverage"],
                 "notional": inputs["notional"],
                 "amount": inputs["amount"],
+                "price_inputs": {
+                    "requested_price": inputs["price"],
+                    "current_market_price": inputs["current_market_price"],
+                },
                 "api_format_notes": {
                     "endpoint_expected": "https://contract.mexc.com/api/v1/private/order/submit",
-                    "signature_method": "ApiKey + Request-Time + exact JSON body",
-                    "body_serialization": "application/json",
+                    "signature_method": "ApiKey + Request-Time + exact serialized body",
+                    "body_serialization": "diagnostics include JSON and form-urlencoded alternatives",
                     "market_order_type": 5,
+                    "market_price_variants": ["price omitted", "price=0", "price=current mark/last/current"],
+                    "volume_format": "diagnostics include integer contract vol when integral",
                     "side_values": {
                         "open_long": 1,
                         "close_short": 2,

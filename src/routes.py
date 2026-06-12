@@ -51,6 +51,9 @@ api.add_resource(ResearchExperimentController, "/api/research/experiments")
 api.add_resource(ResearchCandidateController, "/api/research/candidates")
 api.add_resource(ResearchHeatmapController, "/api/research/heatmaps")
 
+from src.Scanner.ScannerController import ScannerDiagnosticsController
+api.add_resource(ScannerDiagnosticsController, "/api/scanner/diagnostics")
+
 from src.OrderBookRecovery.OrderBookRecoveryController import OrderBookRecoveryConfigController, OrderBookRecoveryStartController, OrderBookRecoveryStopController, OrderBookRecoveryStateController, OrderBookRecoveryTradeController, OrderBookRecoveryMetricsController, OrderBookRecoveryDebugController, OrderBookRecoveryForwardTestController, OrderBookRecoveryForwardTestItemController, OrderBookRecoveryForwardTestMetricsController, OrderBookRecoveryManualCloseController, OrderBookRecoveryTradeArchiveController, OrderBookRecoveryArchiveAllClosedController, OrderBookRecoveryUnarchiveAllController, OrderBookRecoveryTradeDecisionDetailsController, OrderBookRecoveryTradeExportController
 api.add_resource(OrderBookRecoveryConfigController, "/api/orderbook-recovery/config")
 api.add_resource(OrderBookRecoveryStartController, "/api/orderbook-recovery/start-paper")

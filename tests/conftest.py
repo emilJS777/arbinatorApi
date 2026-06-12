@@ -27,6 +27,7 @@ from src.OrderBookRecovery.OrderBookRecoveryService import OrderBookRecoveryServ
 from src.PaperTrading.PaperOrderModel import PaperOrder
 from src.PaperTrading.PaperPositionModel import PaperPosition
 from src.Signal.TradeSignalModel import TradeSignal
+from src.Scanner.ScannerService import ScannerService
 from src.Strategy.StrategyConfigModel import StrategyConfig
 from src.TradingPair.TradingPairModel import TradingPair
 
@@ -45,6 +46,7 @@ def client():
         OrderBookRecoveryService._last_matching_hooks = {}
         OrderBookRecoveryService._last_mismatch_hooks = {}
         OrderBookRecoveryService._mid_price_history.clear()
+        ScannerService._diagnostics = {}
         yield app.test_client()
         db.session.remove()
         OrderBookSnapshotStore.clear()
@@ -55,4 +57,5 @@ def client():
         OrderBookRecoveryService._last_matching_hooks = {}
         OrderBookRecoveryService._last_mismatch_hooks = {}
         OrderBookRecoveryService._mid_price_history.clear()
+        ScannerService._diagnostics = {}
         db.drop_all()

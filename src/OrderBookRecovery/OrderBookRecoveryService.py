@@ -652,6 +652,8 @@ class OrderBookRecoveryService(Response):
             "normalized_asks_count": len(asks),
             "best_bid": float(bids[0]["price"]) if bids else None,
             "best_ask": float(asks[0]["price"]) if asks else None,
+            "fetch_latency_ms": snapshot.get("metadata", {}).get("fetch_latency_ms"),
+            "snapshot_timestamp": snapshot.get("metadata", {}).get("snapshot_timestamp"),
         }
 
     def reason_if_not_trading(self, config, state):
@@ -792,6 +794,8 @@ class OrderBookRecoveryService(Response):
         if snapshot.get("updated_at"):
             age = max(0, (current_time - snapshot["updated_at"]).total_seconds())
         features, error = self.features(config, snapshot)
+        metadata = snapshot.get("metadata") or {}
+        source_snapshot_time = snapshot.get("updated_at")
         item = {
             "exchange": exchange,
             "symbol": symbol,
@@ -801,6 +805,9 @@ class OrderBookRecoveryService(Response):
             "spread_percent": None,
             "momentum": None,
             "snapshot_age_seconds": age,
+            "stale_seconds": age,
+            "source_snapshot_time": source_snapshot_time,
+            "fetch_latency_ms": metadata.get("fetch_latency_ms"),
             "long_signal": False,
             "short_signal": False,
             "valid": False,

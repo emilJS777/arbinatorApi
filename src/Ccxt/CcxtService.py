@@ -8,6 +8,15 @@ from src.Ccxt.CcxtServiceInterface import CcxtServiceInterface
 logger = logging.getLogger(__name__)
 
 class CcxtService(CcxtServiceInterface):
+    def __init__(self):
+        self.exchange = None
+        self._markets_cache = None
+
+    def _markets(self):
+        if self._markets_cache is None:
+            self._markets_cache = self.exchange.load_markets()
+        return self._markets_cache
+
     def create_limit_sell_order(self, symbol: str, amount: float, price: float):
         order = self.exchange.create_order(
             symbol=symbol,
@@ -38,11 +47,8 @@ class CcxtService(CcxtServiceInterface):
         try:
             order_book = self.exchange.fetch_order_book(pair)
 
-            # Получаем информацию о комиссии
-            market_info = self.exchange.load_markets()[pair]
-            # maker_fee = market_info.get('maker', None)
-            taker_fee = market_info.get('taker', None)
-
+            market_info = self._markets().get(pair, {})
+            taker_fee = market_info.get('taker') or 0
 
             sales = []
             for price, amount in order_book['asks'][:limit]:

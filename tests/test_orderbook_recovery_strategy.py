@@ -798,6 +798,101 @@ def test_consensus_short_opens_when_majority_exchanges_confirm_short(client):
     assert result["side"] == "short"
 
 
+def test_median_imbalance_equal_short_threshold_opens_short(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.consensus_enabled = True
+    config.short_imbalance_threshold = 0.77
+    config.min_confirming_exchanges = 2
+    config.min_consensus_ratio = 0.6
+    config.require_configured_exchange_signal = True
+    db.session.commit()
+    for exchange in ["Mexc", "Binance", "Bybit"]:
+        prime_momentum(service, config, exchange, old_bid=101, old_ask=101.01)
+        add_snapshot(exchange, bid=100, ask=100.01, bid_amount=7.7, ask_amount=10)
+
+    result = service.evaluate(config)
+    last = service.signal_diagnostics_for(config)["last_100"][-1]
+
+    assert result["side"] == "short"
+    assert last["short_threshold_hit"] is True
+    assert last["final_side"] == "short"
+
+
+def test_after_long_loss_strategy_can_open_short_when_signal_flips(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.consensus_enabled = True
+    config.min_confirming_exchanges = 2
+    config.min_consensus_ratio = 0.6
+    config.require_configured_exchange_signal = True
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+    first = service.evaluate(config)
+    long_trade = db.session.get(StrategyRunTrade, first["id"])
+    state = service.get_or_create_state(config)
+    service.close_trade(long_trade, 90, -1, "stop_loss", state, config, datetime.utcnow())
+    OrderBookSnapshotStore.clear()
+    service._mid_price_history.clear()
+    setup_short_consensus(service, config)
+
+    second = service.evaluate(config)
+
+    assert long_trade.result == "loss"
+    assert state.current_step == 1
+    assert second["side"] == "short"
+
+
+def test_feedback_long_loss_streak_does_not_block_short(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.consensus_enabled = True
+    config.feedback_enabled = True
+    config.side_loss_streak_limit = 3
+    config.side_cooldown_seconds = 600
+    config.min_confirming_exchanges = 2
+    config.min_consensus_ratio = 0.6
+    config.require_configured_exchange_signal = True
+    db.session.commit()
+    for _ in range(3):
+        closed_trade(config, pnl=-1, side="long")
+    setup_short_consensus(service, config)
+
+    result = service.evaluate(config)
+    last = service.signal_diagnostics_for(config)["last_100"][-1]
+
+    assert result["side"] == "short"
+    assert last["short_blocked_by_feedback"] is False
+
+
+def test_require_configured_signal_allows_configured_short_without_preferring_long(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.consensus_enabled = True
+    config.min_confirming_exchanges = 2
+    config.min_consensus_ratio = 0.6
+    config.require_configured_exchange_signal = True
+    db.session.commit()
+    setup_short_consensus(service, config)
+
+    result = service.evaluate(config)
+    last = service.signal_diagnostics_for(config)["last_100"][-1]
+
+    assert result["side"] == "short"
+    assert last["configured_exchange_short_signal"] is True
+    assert last["configured_exchange_long_signal"] is False
+    assert last["final_side"] == "short"
+
+
 def test_signal_diagnostics_tracks_long_and_short_decisions(client):
     service = OrderBookRecoveryService()
     config = make_config(service)
@@ -823,6 +918,8 @@ def test_signal_diagnostics_tracks_long_and_short_decisions(client):
     assert last["short_confirms"] >= 2
     assert last["short_ratio"] >= 0.6
     assert last["long_confirms"] == 0
+    assert last["why_short_rejected"] is None
+    assert last["short_consensus_passed"] is True
 
 
 def test_debug_returns_signal_diagnostics_and_counters(client):
@@ -844,9 +941,14 @@ def test_debug_returns_signal_diagnostics_and_counters(client):
     assert debug["long_opened_count"] == 1
     assert debug["short_signals_count"] == 0
     assert debug["short_opened_count"] == 0
+    assert debug["raw_long_threshold_hits"] == 1
+    assert debug["long_consensus_passed_count"] == 1
+    assert debug["final_long_count"] == 1
     assert len(debug["signal_diagnostics_last_100"]) == 1
     assert debug["signal_diagnostics_last_100"][0]["proposed_side"] == "long"
     assert debug["signal_diagnostics_last_100"][0]["final_side"] == "long"
+    assert "long_threshold_hit" in debug["signal_diagnostics_last_100"][0]["why_long_selected"]
+    assert debug["signal_diagnostics_last_100"][0]["short_threshold_hit"] is False
 
 
 def test_signal_diagnostics_history_trimmed_to_config_max_rows(client):
@@ -889,6 +991,14 @@ def test_signal_diagnostics_clear_endpoint_clears_history_and_counters(client):
         "short_signals_count": 0,
         "long_opened_count": 0,
         "short_opened_count": 0,
+        "raw_long_threshold_hits": 0,
+        "raw_short_threshold_hits": 0,
+        "long_consensus_passed_count": 0,
+        "short_consensus_passed_count": 0,
+        "long_blocked_count": 0,
+        "short_blocked_count": 0,
+        "final_long_count": 0,
+        "final_short_count": 0,
     }
 
 

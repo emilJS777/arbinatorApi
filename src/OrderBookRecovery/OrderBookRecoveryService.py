@@ -47,6 +47,14 @@ class OrderBookRecoveryService(Response):
         "short_signals_count": 0,
         "long_opened_count": 0,
         "short_opened_count": 0,
+        "raw_long_threshold_hits": 0,
+        "raw_short_threshold_hits": 0,
+        "long_consensus_passed_count": 0,
+        "short_consensus_passed_count": 0,
+        "long_blocked_count": 0,
+        "short_blocked_count": 0,
+        "final_long_count": 0,
+        "final_short_count": 0,
     })
 
     def __init__(self, publisher=None, live_execution_service=None):
@@ -734,7 +742,7 @@ class OrderBookRecoveryService(Response):
             return self.reject(reject_reason, config, state)
 
         long_signal = features["imbalance"] > config.long_imbalance_threshold and features["short_momentum"] > 0
-        short_signal = features["imbalance"] < config.short_imbalance_threshold and features["short_momentum"] < 0
+        short_signal = features["imbalance"] <= config.short_imbalance_threshold and features["short_momentum"] < 0
         open_trade = self.open_trade(config)
         if open_trade:
             self.store_last_evaluation(config, features, long_signal, short_signal, "none", None, current_time)
@@ -863,6 +871,76 @@ class OrderBookRecoveryService(Response):
             return "short"
         return "none"
 
+    def side_decision_audit(self, config, features=None, consensus=None, feedback=None, final_side=None):
+        features = features or {}
+        consensus = consensus or {}
+        feedback = feedback or consensus.get("feedback") or {}
+        median = consensus.get("median_imbalance")
+        threshold_source = median if median is not None else features.get("imbalance")
+        long_threshold_hit = threshold_source is not None and threshold_source > float(config.long_imbalance_threshold)
+        short_threshold_hit = threshold_source is not None and threshold_source <= float(config.short_imbalance_threshold)
+        min_count = int(config.min_confirming_exchanges)
+        min_ratio = float(config.min_consensus_ratio)
+        valid_count = int(consensus.get("valid_exchanges_count") or 0)
+        average_momentum = consensus.get("average_momentum", features.get("short_momentum") or 0) or 0
+        long_consensus_passed = (
+            valid_count >= int(config.min_valid_exchanges)
+            and (consensus.get("confirming_long_count") or 0) >= min_count
+            and (consensus.get("consensus_ratio_long") or 0) >= min_ratio
+            and average_momentum > 0
+            and long_threshold_hit
+        )
+        short_consensus_passed = (
+            valid_count >= int(config.min_valid_exchanges)
+            and (consensus.get("confirming_short_count") or 0) >= min_count
+            and (consensus.get("consensus_ratio_short") or 0) >= min_ratio
+            and average_momentum < 0
+            and short_threshold_hit
+        )
+        configured_long = bool(consensus.get("configured_exchange_long_signal"))
+        configured_short = bool(consensus.get("configured_exchange_short_signal"))
+        long_blocked_by_configured = bool(config.require_configured_exchange_signal and long_consensus_passed and not configured_long)
+        short_blocked_by_configured = bool(config.require_configured_exchange_signal and short_consensus_passed and not configured_short)
+        long_blocked_by_feedback = bool(feedback.get("blocked_side") == "long" or (final_side != "long" and feedback.get("feedback_reject_reason") and consensus.get("consensus_direction") == "long"))
+        short_blocked_by_feedback = bool(feedback.get("blocked_side") == "short" or (final_side != "short" and feedback.get("feedback_reject_reason") and consensus.get("consensus_direction") == "short"))
+        long_blocked_by_consensus = bool(long_threshold_hit and not long_consensus_passed)
+        short_blocked_by_consensus = bool(short_threshold_hit and not short_consensus_passed)
+        short_reasons = []
+        if not short_threshold_hit:
+            short_reasons.append("median_above_short_threshold")
+        if short_blocked_by_consensus:
+            short_reasons.append("short_consensus_not_met")
+        if short_blocked_by_configured:
+            short_reasons.append("configured_exchange_not_short")
+        if short_blocked_by_feedback:
+            short_reasons.append(feedback.get("feedback_reject_reason") or "short_blocked_by_feedback")
+        if final_side == "long" and short_threshold_hit:
+            short_reasons.append("long_selected")
+        long_reasons = []
+        if final_side == "long":
+            long_reasons.append("long_consensus_selected" if consensus.get("consensus_direction") == "long" else "long_signal_selected")
+            if long_threshold_hit:
+                long_reasons.append("long_threshold_hit")
+            if configured_long:
+                long_reasons.append("configured_exchange_long_signal")
+        return {
+            "why_long_selected": ", ".join(long_reasons) if long_reasons else None,
+            "why_short_rejected": ", ".join(short_reasons) if short_reasons else None,
+            "configured_exchange_long_signal": configured_long,
+            "configured_exchange_short_signal": configured_short,
+            "median_imbalance_vs_threshold": f"{threshold_source} vs long>{config.long_imbalance_threshold}, short<={config.short_imbalance_threshold}",
+            "long_threshold_hit": bool(long_threshold_hit),
+            "short_threshold_hit": bool(short_threshold_hit),
+            "short_blocked_by_feedback": short_blocked_by_feedback,
+            "short_blocked_by_configured_exchange": short_blocked_by_configured,
+            "short_blocked_by_consensus": short_blocked_by_consensus,
+            "long_blocked_by_feedback": long_blocked_by_feedback,
+            "long_blocked_by_configured_exchange": long_blocked_by_configured,
+            "long_blocked_by_consensus": long_blocked_by_consensus,
+            "long_consensus_passed": bool(long_consensus_passed and not long_blocked_by_configured),
+            "short_consensus_passed": bool(short_consensus_passed and not short_blocked_by_configured),
+        }
+
     def record_signal_diagnostic(
         self,
         config,
@@ -880,6 +958,7 @@ class OrderBookRecoveryService(Response):
         key = self.debug_key(config)
         proposed_side = proposed_side or self.diagnostic_side(long_signal, short_signal, consensus)
         final_side = final_side or "none"
+        audit = self.side_decision_audit(config, features, consensus, feedback, final_side)
         row = {
             "timestamp": evaluated_at or datetime.utcnow(),
             "median_imbalance": consensus.get("median_imbalance"),
@@ -900,9 +979,26 @@ class OrderBookRecoveryService(Response):
             "short_signal": bool(short_signal),
             "consensus_direction": consensus.get("consensus_direction"),
             "feedback_reject_reason": feedback.get("feedback_reject_reason"),
+            **audit,
         }
         self.__class__._signal_diagnostics[key].append(row)
         self.trim_signal_diagnostics(config)
+        if audit["long_threshold_hit"]:
+            self.__class__._signal_counters[key]["raw_long_threshold_hits"] += 1
+        if audit["short_threshold_hit"]:
+            self.__class__._signal_counters[key]["raw_short_threshold_hits"] += 1
+        if audit["long_consensus_passed"]:
+            self.__class__._signal_counters[key]["long_consensus_passed_count"] += 1
+        if audit["short_consensus_passed"]:
+            self.__class__._signal_counters[key]["short_consensus_passed_count"] += 1
+        if final_side == "long":
+            self.__class__._signal_counters[key]["final_long_count"] += 1
+        elif final_side == "short":
+            self.__class__._signal_counters[key]["final_short_count"] += 1
+        if proposed_side == "long" and final_side != "long":
+            self.__class__._signal_counters[key]["long_blocked_count"] += 1
+        if proposed_side == "short" and final_side != "short":
+            self.__class__._signal_counters[key]["short_blocked_count"] += 1
         if proposed_side == "long":
             self.__class__._signal_counters[key]["long_signals_count"] += 1
         elif proposed_side == "short":
@@ -946,6 +1042,14 @@ class OrderBookRecoveryService(Response):
             "short_signals_count": 0,
             "long_opened_count": 0,
             "short_opened_count": 0,
+            "raw_long_threshold_hits": 0,
+            "raw_short_threshold_hits": 0,
+            "long_consensus_passed_count": 0,
+            "short_consensus_passed_count": 0,
+            "long_blocked_count": 0,
+            "short_blocked_count": 0,
+            "final_long_count": 0,
+            "final_short_count": 0,
         }
         return self.response_ok(self.signal_diagnostics_for(config))
 
@@ -1356,7 +1460,7 @@ class OrderBookRecoveryService(Response):
             "spread_percent": features["spread_percent"],
             "momentum": features["short_momentum"],
             "long_signal": raw_imbalance > config.long_imbalance_threshold,
-            "short_signal": raw_imbalance < config.short_imbalance_threshold,
+            "short_signal": raw_imbalance <= config.short_imbalance_threshold,
         })
         if age is not None and age > float(config.max_snapshot_age_seconds):
             item["reject_reason"] = "stale_snapshot"
@@ -1465,7 +1569,7 @@ class OrderBookRecoveryService(Response):
         )
         if config.use_median_imbalance:
             long_ok = long_ok and median_imbalance > float(config.long_imbalance_threshold)
-            short_ok = short_ok and median_imbalance < float(config.short_imbalance_threshold)
+            short_ok = short_ok and median_imbalance <= float(config.short_imbalance_threshold)
         if config.require_configured_exchange_signal:
             long_ok = long_ok and consensus["configured_exchange_long_signal"]
             short_ok = short_ok and consensus["configured_exchange_short_signal"]
@@ -1490,7 +1594,7 @@ class OrderBookRecoveryService(Response):
                 config,
                 features,
                 features["imbalance"] > config.long_imbalance_threshold and features["short_momentum"] > 0,
-                features["imbalance"] < config.short_imbalance_threshold and features["short_momentum"] < 0,
+                features["imbalance"] <= config.short_imbalance_threshold and features["short_momentum"] < 0,
                 "none",
                 risk_reason,
                 current_time,
@@ -1502,7 +1606,7 @@ class OrderBookRecoveryService(Response):
             return self.consensus_signal(config, current_time)
         if features["imbalance"] > config.long_imbalance_threshold and features["short_momentum"] > 0:
             return "long", {}
-        if features["imbalance"] < config.short_imbalance_threshold and features["short_momentum"] < 0:
+        if features["imbalance"] <= config.short_imbalance_threshold and features["short_momentum"] < 0:
             return "short", {}
         return None, {"reject_reason": "no_signal"}
 

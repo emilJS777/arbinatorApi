@@ -41,6 +41,13 @@ class OrderBookRecoveryService(Response):
     _pending_entries = {}
     _last_confirmation_results = {}
     _live_market_infos = {}
+    _signal_diagnostics = defaultdict(lambda: deque(maxlen=100))
+    _signal_counters = defaultdict(lambda: {
+        "long_signals_count": 0,
+        "short_signals_count": 0,
+        "long_opened_count": 0,
+        "short_opened_count": 0,
+    })
 
     def __init__(self, publisher=None, live_execution_service=None):
         self.publisher = publisher or EventPublisher()
@@ -707,17 +714,21 @@ class OrderBookRecoveryService(Response):
         self.resume_after_recovery_pause(config, state, current_time)
 
         if not config.enabled or state.is_stopped:
-            self.store_last_evaluation(config, reject_reason=self.reason_if_not_trading(config, state), evaluated_at=current_time)
+            reason = self.reason_if_not_trading(config, state)
+            self.store_last_evaluation(config, reject_reason=reason, evaluated_at=current_time)
+            self.record_signal_diagnostic(config, reject_reason=reason, evaluated_at=current_time)
             return None
 
         snapshot = snapshot or self.snapshot_for(config.exchange, config.symbol)
         if not snapshot:
             self.store_last_evaluation(config, reject_reason="no_valid_order_book_snapshot", evaluated_at=current_time)
+            self.record_signal_diagnostic(config, reject_reason="no_valid_order_book_snapshot", evaluated_at=current_time)
             return self.reject("no_valid_order_book_snapshot", config, state)
 
         features, reject_reason = self.features(config, snapshot)
         if not features:
             self.store_last_evaluation(config, reject_reason=reject_reason, evaluated_at=current_time)
+            self.record_signal_diagnostic(config, reject_reason=reject_reason, evaluated_at=current_time)
             return self.reject(reject_reason, config, state)
 
         long_signal = features["imbalance"] > config.long_imbalance_threshold and features["short_momentum"] > 0
@@ -742,6 +753,17 @@ class OrderBookRecoveryService(Response):
         if config.entry_mode == "two_step_confirmation":
             return self.handle_two_step_entry(config, state, features, long_signal, short_signal, signal, consensus, reject_reason, current_time)
         self.store_last_evaluation(config, features, long_signal, short_signal, signal or "none", reject_reason, current_time, consensus)
+        self.record_signal_diagnostic(
+            config,
+            features,
+            long_signal,
+            short_signal,
+            proposed_side=self.diagnostic_side(long_signal, short_signal, consensus),
+            final_side=signal or "none",
+            reject_reason=reject_reason,
+            evaluated_at=current_time,
+            consensus=consensus,
+        )
         logger.info(
             "OrderBookRecovery evaluation result: exchange=%s symbol=%s decision=%s imbalance=%s spread=%s momentum=%s",
             config.exchange,
@@ -826,6 +848,76 @@ class OrderBookRecoveryService(Response):
             "reject_reason": reject_reason,
             "evaluated_at": evaluated_at,
             "consensus": consensus or {},
+        }
+
+    def diagnostic_side(self, long_signal=False, short_signal=False, consensus=None):
+        consensus = consensus or {}
+        direction = consensus.get("consensus_direction")
+        if direction in ("long", "short"):
+            return direction
+        if long_signal and not short_signal:
+            return "long"
+        if short_signal and not long_signal:
+            return "short"
+        return "none"
+
+    def record_signal_diagnostic(
+        self,
+        config,
+        features=None,
+        long_signal=False,
+        short_signal=False,
+        proposed_side=None,
+        final_side=None,
+        reject_reason=None,
+        evaluated_at=None,
+        consensus=None,
+    ):
+        consensus = consensus or {}
+        feedback = consensus.get("feedback") or {}
+        key = self.debug_key(config)
+        proposed_side = proposed_side or self.diagnostic_side(long_signal, short_signal, consensus)
+        final_side = final_side or "none"
+        row = {
+            "timestamp": evaluated_at or datetime.utcnow(),
+            "median_imbalance": consensus.get("median_imbalance"),
+            "avg_imbalance": consensus.get("average_imbalance"),
+            "raw_average_imbalance": consensus.get("raw_average_imbalance"),
+            "momentum": consensus.get("average_momentum", (features or {}).get("short_momentum")),
+            "long_confirms": consensus.get("confirming_long_count"),
+            "short_confirms": consensus.get("confirming_short_count"),
+            "long_ratio": consensus.get("consensus_ratio_long"),
+            "short_ratio": consensus.get("consensus_ratio_short"),
+            "proposed_side": proposed_side,
+            "final_side": final_side,
+            "reject_reason": reject_reason or consensus.get("reject_reason"),
+            "blocked_side": feedback.get("blocked_side"),
+            "long_win_rate": feedback.get("long_recent_win_rate"),
+            "short_win_rate": feedback.get("short_recent_win_rate"),
+            "long_signal": bool(long_signal),
+            "short_signal": bool(short_signal),
+            "consensus_direction": consensus.get("consensus_direction"),
+            "feedback_reject_reason": feedback.get("feedback_reject_reason"),
+        }
+        self.__class__._signal_diagnostics[key].append(row)
+        if proposed_side == "long":
+            self.__class__._signal_counters[key]["long_signals_count"] += 1
+        elif proposed_side == "short":
+            self.__class__._signal_counters[key]["short_signals_count"] += 1
+        return row
+
+    def record_opened_side(self, config, side):
+        key = self.debug_key(config)
+        if side == "long":
+            self.__class__._signal_counters[key]["long_opened_count"] += 1
+        elif side == "short":
+            self.__class__._signal_counters[key]["short_opened_count"] += 1
+
+    def signal_diagnostics_for(self, config):
+        key = self.debug_key(config)
+        return {
+            "counters": dict(self.__class__._signal_counters[key]),
+            "last_100": list(self.__class__._signal_diagnostics[key]),
         }
 
     def pending_key(self, config):
@@ -936,11 +1028,13 @@ class OrderBookRecoveryService(Response):
                 self.clear_pending_entry(config, "expired", "confirmation_expired", current_time)
                 consensus["reject_reason"] = "confirmation_expired"
                 self.store_last_evaluation(config, features, long_signal, short_signal, "none", "confirmation_expired", current_time, consensus)
+                self.record_signal_diagnostic(config, features, long_signal, short_signal, proposed_side=pending.get("side"), final_side="none", reject_reason="confirmation_expired", evaluated_at=current_time, consensus=consensus)
                 return None
             ready_at = pending["created_at"] + timedelta(seconds=float(config.confirmation_delay_seconds))
             if current_time < ready_at:
                 consensus["reject_reason"] = "confirmation_waiting"
                 self.store_last_evaluation(config, features, long_signal, short_signal, "none", "confirmation_waiting", current_time, consensus)
+                self.record_signal_diagnostic(config, features, long_signal, short_signal, proposed_side=pending.get("side"), final_side="none", reject_reason="confirmation_waiting", evaluated_at=current_time, consensus=consensus)
                 return None
             reason = self.confirmation_reject_reason(config, pending, signal, consensus)
             if reason:
@@ -948,6 +1042,7 @@ class OrderBookRecoveryService(Response):
                 self.clear_pending_entry(config, "cancelled", reject, current_time)
                 consensus["reject_reason"] = reject
                 self.store_last_evaluation(config, features, long_signal, short_signal, "none", reject, current_time, consensus)
+                self.record_signal_diagnostic(config, features, long_signal, short_signal, proposed_side=pending.get("side"), final_side="none", reject_reason=reject, evaluated_at=current_time, consensus=consensus)
                 return None
             confirmation_snapshot = self.consensus_summary_snapshot(features, consensus, current_time)
             actual_delay = (current_time - pending["created_at"]).total_seconds()
@@ -963,15 +1058,18 @@ class OrderBookRecoveryService(Response):
             self.clear_pending_entry(config, "confirmed", None, current_time)
             consensus["reject_reason"] = None
             self.store_last_evaluation(config, features, long_signal, short_signal, pending["side"], None, current_time, consensus)
+            self.record_signal_diagnostic(config, features, long_signal, short_signal, proposed_side=pending.get("side"), final_side=pending.get("side"), reject_reason=None, evaluated_at=current_time, consensus=consensus)
             return self.open_position(config, state, features, pending["side"], current_time, consensus, context)
 
         if signal:
             pending = self.create_pending_entry(config, features, signal, consensus, current_time)
             consensus["reject_reason"] = "confirmation_pending"
             self.store_last_evaluation(config, features, long_signal, short_signal, "none", "confirmation_pending", current_time, consensus)
+            self.record_signal_diagnostic(config, features, long_signal, short_signal, proposed_side=signal, final_side="none", reject_reason="confirmation_pending", evaluated_at=current_time, consensus=consensus)
             return None
 
         self.store_last_evaluation(config, features, long_signal, short_signal, "none", reject_reason, current_time, consensus)
+        self.record_signal_diagnostic(config, features, long_signal, short_signal, proposed_side=self.diagnostic_side(long_signal, short_signal, consensus), final_side="none", reject_reason=reject_reason, evaluated_at=current_time, consensus=consensus)
         return None
 
     def last_evaluation_for(self, config):
@@ -1059,6 +1157,7 @@ class OrderBookRecoveryService(Response):
         pending = self.pending_entry_for(config) or {}
         confirmation = self.__class__._last_confirmation_results.get(self.pending_key(config)) or {}
         live_market = self.live_market_debug(config)
+        signal_diagnostics = self.signal_diagnostics_for(config)
         margin_limit = self.live_execution_service.margin_limit_debug(
             config,
             state.current_margin or config.base_margin_usdt,
@@ -1116,6 +1215,9 @@ class OrderBookRecoveryService(Response):
             "blocked_side": feedback.get("blocked_side"),
             "feedback_reject_reason": feedback.get("feedback_reject_reason"),
             "feedback": feedback,
+            "signal_diagnostics": signal_diagnostics["last_100"],
+            "signal_diagnostics_last_100": signal_diagnostics["last_100"],
+            **signal_diagnostics["counters"],
             "per_exchange_features": consensus.get("per_exchange_features") or [],
             "latest_snapshot": self.latest_snapshot_for(config),
             "last_snapshot_source_exchange": (self.latest_snapshot_for(config) or {}).get("source_exchange"),
@@ -1599,6 +1701,7 @@ class OrderBookRecoveryService(Response):
         if live_error:
             logger.warning("OrderBookRecovery live open failed: trade_id=%s error=%s", trade.id, live_error)
             return payload
+        self.record_opened_side(config, side)
         logger.info("OrderBookRecovery position opened: trade_id=%s side=%s margin=%s entry=%s", trade.id, side, margin, entry_price)
         self.publisher.publish("orderbook_recovery.position_opened", payload)
         return payload

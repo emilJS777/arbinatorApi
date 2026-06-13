@@ -798,6 +798,57 @@ def test_consensus_short_opens_when_majority_exchanges_confirm_short(client):
     assert result["side"] == "short"
 
 
+def test_signal_diagnostics_tracks_long_and_short_decisions(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.consensus_enabled = True
+    config.min_confirming_exchanges = 2
+    config.min_consensus_ratio = 0.6
+    config.require_configured_exchange_signal = True
+    db.session.commit()
+    setup_short_consensus(service, config)
+
+    result = service.evaluate(config)
+    diagnostics = service.signal_diagnostics_for(config)
+    last = diagnostics["last_100"][-1]
+
+    assert result["side"] == "short"
+    assert diagnostics["counters"]["short_signals_count"] == 1
+    assert diagnostics["counters"]["short_opened_count"] == 1
+    assert diagnostics["counters"]["long_signals_count"] == 0
+    assert last["proposed_side"] == "short"
+    assert last["final_side"] == "short"
+    assert last["short_confirms"] >= 2
+    assert last["short_ratio"] >= 0.6
+    assert last["long_confirms"] == 0
+
+
+def test_debug_returns_signal_diagnostics_and_counters(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.consensus_enabled = True
+    config.min_confirming_exchanges = 2
+    config.min_consensus_ratio = 0.6
+    config.require_configured_exchange_signal = True
+    db.session.commit()
+    setup_long_consensus(service, config)
+
+    service.evaluate(config)
+    debug = service.debug_payload(config, service.get_or_create_state(config))
+
+    assert debug["long_signals_count"] == 1
+    assert debug["long_opened_count"] == 1
+    assert debug["short_signals_count"] == 0
+    assert debug["short_opened_count"] == 0
+    assert len(debug["signal_diagnostics_last_100"]) == 1
+    assert debug["signal_diagnostics_last_100"][0]["proposed_side"] == "long"
+    assert debug["signal_diagnostics_last_100"][0]["final_side"] == "long"
+
+
 def test_consensus_no_trade_when_configured_exchange_snapshot_missing(client):
     service = OrderBookRecoveryService()
     config = make_config(service)
@@ -2677,7 +2728,7 @@ def test_frontend_export_api_method_exists():
 def test_frontend_exchange_tpsl_fields_visible():
     frontend_view = Path("/Users/emilhambardzumyan/WebstormProjects/arbinator/src/views/orderBookRecovery/v-order-book-recovery.vue").read_text()
 
-    assert "TP/SL protected" in frontend_view
+    assert "TP/SL protection" in frontend_view
     assert "Exchange TP/SL not created" in frontend_view
     assert "Exchange position already closed" in frontend_view
     assert "Closed externally on exchange" in frontend_view

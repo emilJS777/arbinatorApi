@@ -46,6 +46,8 @@ def client():
         OrderBookRecoveryService._last_matching_hooks = {}
         OrderBookRecoveryService._last_mismatch_hooks = {}
         OrderBookRecoveryService._live_market_infos = {}
+        OrderBookRecoveryService._signal_diagnostics.clear()
+        OrderBookRecoveryService._signal_counters.clear()
         OrderBookRecoveryService._mid_price_history.clear()
         ScannerService._diagnostics = {}
         yield app.test_client()
@@ -58,6 +60,8 @@ def client():
         OrderBookRecoveryService._last_matching_hooks = {}
         OrderBookRecoveryService._last_mismatch_hooks = {}
         OrderBookRecoveryService._live_market_infos = {}
+        OrderBookRecoveryService._signal_diagnostics.clear()
+        OrderBookRecoveryService._signal_counters.clear()
         OrderBookRecoveryService._mid_price_history.clear()
         ScannerService._diagnostics = {}
         db.drop_all()

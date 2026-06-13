@@ -180,4 +180,7 @@ class StrategyRunTrade(Model, db.Model):
     tp_sl_protected = db.Column(db.Boolean, default=False, nullable=False)
     tp_sl_error = db.Column(db.Text, nullable=True)
     tp_sl_created_at = db.Column(db.DateTime, nullable=True)
+    exit_price_fallback_used = db.Column(db.Boolean, default=False, nullable=False)
+    exit_price_warning = db.Column(db.Text, nullable=True)
+    pnl_source = db.Column(db.String(40), nullable=True)
     holding_seconds = db.Column(db.Float, nullable=True)

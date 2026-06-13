@@ -314,10 +314,17 @@ class LiveExecutionService:
             return
         code = response.get("code")
         success = response.get("success")
+        message = str(response.get("message") or response.get("msg") or "")
         if str(code) == "6026":
             raise LiveExecutionError("mexc_risk_control_verification_required")
+        if str(code) == "2009" or "Position is nonexistent or closed" in message:
+            raise LiveExecutionError("mexc_position_already_closed")
         if success is False or (code not in (None, 0, 200, "0", "200")):
             raise LiveExecutionError(f"live_mexc_order_failed:{response}")
+
+    def is_position_already_closed_error(self, error):
+        text = str(error)
+        return "mexc_position_already_closed" in text or "Position is nonexistent or closed" in text or "code': 2009" in text or '"code":2009' in text
 
     def build_mexc_order_submit_request(self, client, market, order_type, side, amount, price=None, reduce_only=False, leverage=None, contract_detail=None):
         symbol = market.get("symbol")

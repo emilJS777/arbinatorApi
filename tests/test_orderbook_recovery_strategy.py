@@ -98,7 +98,7 @@ def seed_live_exchange(title="Mexc", api_key="key", api_secret="secret"):
 
 
 class MockLiveClient:
-    def __init__(self, fail_close=False, fail_open=False, markets=None, exchange_id="mock", fail_contract_open=False):
+    def __init__(self, fail_close=False, fail_open=False, markets=None, exchange_id="mock", fail_contract_open=False, positions=None):
         self.id = exchange_id
         self.orders = []
         self.contract_orders = []
@@ -106,6 +106,7 @@ class MockLiveClient:
         self.fail_open = fail_open
         self.fail_contract_open = fail_contract_open
         self.markets = markets or {"TON/USDT": {"symbol": "TON/USDT", "swap": True, "contract": True, "base": "TON", "quote": "USDT", "settle": "USDT", "linear": True}}
+        self.positions = positions
 
     def load_markets(self):
         return self.markets
@@ -118,6 +119,12 @@ class MockLiveClient:
 
     def price_to_precision(self, symbol, price):
         return price
+
+    def fetch_positions(self):
+        if self.positions is not None:
+            return self.positions
+        symbol = next(iter(self.markets.keys()))
+        return [{"symbol": symbol, "contracts": 1}]
 
     def sign(self, path, api=None, method="GET", params=None):
         body = json.dumps(params or {}, separators=(",", ":")) if method == "POST" else None
@@ -213,6 +220,21 @@ class FailingTpSlRequests(MockMexcSubmitRequests):
         })
         if "planorder/place" in url:
             return self.Response(200, '{"success":false,"code":500,"message":"plan failed"}')
+        return self.Response(self.status_code, self.text)
+
+
+class AlreadyClosedOnCloseRequests(MockMexcSubmitRequests):
+    def request(self, method, url, headers=None, data=None, timeout=None):
+        body = json.loads(data or "{}")
+        self.calls.append({
+            "method": method,
+            "url": url,
+            "headers": headers or {},
+            "data": data,
+            "timeout": timeout,
+        })
+        if "order/create" in url and body.get("side") in (2, 4):
+            return self.Response(200, '{"success":false,"code":2009,"message":"Position is nonexistent or closed"}')
         return self.Response(self.status_code, self.text)
 
 
@@ -1674,6 +1696,96 @@ def test_manual_close_live_failed_does_not_mark_trade_closed(client):
     assert trade.live_status == "close_failed"
 
 
+def test_manual_close_mexc_2009_reconciles_as_closed(client):
+    mock_client = MockLiveClient(exchange_id="mexc", markets={
+        "BTC/USDT:USDT": {
+            "id": "BTC_USDT",
+            "symbol": "BTC/USDT:USDT",
+            "type": "swap",
+            "swap": True,
+            "contract": True,
+            "linear": True,
+            "base": "BTC",
+            "quote": "USDT",
+            "settle": "USDT",
+            "contractSize": 0.001,
+        },
+    })
+    requests_client = AlreadyClosedOnCloseRequests()
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client, requests_client=requests_client))
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "BTC/USDT"
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    config.feedback_enabled = False
+    db.session.commit()
+    for source_exchange in ["Mexc", "Binance", "Bybit"]:
+        prime_momentum(service, config, source_exchange, symbol="BTC/USDT")
+        add_snapshot(source_exchange, symbol="BTC/USDT", bid=100, ask=100.01, bid_amount=10, ask_amount=5)
+    service.evaluate(config)
+    trade = StrategyRunTrade.query.first()
+    add_snapshot("Mexc", symbol="BTC/USDT", bid=101, ask=101.01, bid_amount=10, ask_amount=5)
+
+    response = service.close_manual(trade.id, {"reason": "manual_close"})
+
+    assert response.status_code == 200
+    assert trade.closed_at is not None
+    assert trade.live_status == "closed"
+    assert trade.reason_close == "exchange_position_already_closed"
+    assert trade.exit_price_fallback_used is True
+    assert trade.exit_price_warning == "position already closed on exchange; used latest market price"
+    assert trade.pnl_source == "fallback_market_price"
+    assert "position already closed" in trade.live_error
+
+
+def test_external_exchange_close_reconciliation_closes_local_trade(client):
+    mock_client = MockLiveClient(exchange_id="mexc", positions=[], markets={
+        "BTC/USDT:USDT": {
+            "id": "BTC_USDT",
+            "symbol": "BTC/USDT:USDT",
+            "type": "swap",
+            "swap": True,
+            "contract": True,
+            "linear": True,
+            "base": "BTC",
+            "quote": "USDT",
+            "settle": "USDT",
+            "contractSize": 0.001,
+        },
+    })
+    requests_client = MockMexcSubmitRequests()
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client, requests_client=requests_client))
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "BTC/USDT"
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    config.feedback_enabled = False
+    db.session.commit()
+    for source_exchange in ["Mexc", "Binance", "Bybit"]:
+        prime_momentum(service, config, source_exchange, symbol="BTC/USDT")
+        add_snapshot(source_exchange, symbol="BTC/USDT", bid=100, ask=100.01, bid_amount=10, ask_amount=5)
+    service.evaluate(config)
+    trade = StrategyRunTrade.query.first()
+    trade.tp_sl_protected = False
+    db.session.commit()
+
+    result = service.evaluate(config, current_time=datetime.utcnow() + timedelta(seconds=1))
+
+    assert result["reason_close"] == "exchange_position_closed_external"
+    assert trade.closed_at is not None
+    assert trade.live_status == "closed"
+    assert trade.exit_price_fallback_used is True
+    assert trade.pnl_source == "fallback_market_price"
+
+
 def test_live_resolves_configured_symbol_to_swap_symbol(client):
     service = LiveExecutionService()
     client = MockLiveClient(markets={
@@ -2567,6 +2679,10 @@ def test_frontend_exchange_tpsl_fields_visible():
 
     assert "TP/SL protected" in frontend_view
     assert "Exchange TP/SL not created" in frontend_view
+    assert "Exchange position already closed" in frontend_view
+    assert "Closed externally on exchange" in frontend_view
+    assert "exit_price_warning" in frontend_view
+    assert "pnl_source" in frontend_view
     assert "tp_sl_protected" in frontend_view
     assert "exchange_tp_price" in frontend_view
     assert "exchange_sl_price" in frontend_view

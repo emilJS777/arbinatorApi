@@ -41,7 +41,7 @@ class OrderBookRecoveryService(Response):
     _pending_entries = {}
     _last_confirmation_results = {}
     _live_market_infos = {}
-    _signal_diagnostics = defaultdict(lambda: deque(maxlen=100))
+    _signal_diagnostics = defaultdict(lambda: deque(maxlen=500))
     _signal_counters = defaultdict(lambda: {
         "long_signals_count": 0,
         "short_signals_count": 0,
@@ -182,6 +182,7 @@ class OrderBookRecoveryService(Response):
             "min_side_win_rate",
             "adaptive_consensus_boost",
             "adaptive_min_valid_exchanges_boost",
+            "signal_diagnostics_max_rows",
             "paper_equity_usdt",
         }
         for key in allowed:
@@ -193,6 +194,7 @@ class OrderBookRecoveryService(Response):
             config.execution_mode = "paper"
         if config.live_order_type not in {"market", "limit"}:
             config.live_order_type = "market"
+        config.signal_diagnostics_max_rows = min(500, max(20, int(config.signal_diagnostics_max_rows or 100)))
         config.paper_mode_only = True
 
     def update_config(self, body: dict):
@@ -900,6 +902,7 @@ class OrderBookRecoveryService(Response):
             "feedback_reject_reason": feedback.get("feedback_reject_reason"),
         }
         self.__class__._signal_diagnostics[key].append(row)
+        self.trim_signal_diagnostics(config)
         if proposed_side == "long":
             self.__class__._signal_counters[key]["long_signals_count"] += 1
         elif proposed_side == "short":
@@ -913,12 +916,38 @@ class OrderBookRecoveryService(Response):
         elif side == "short":
             self.__class__._signal_counters[key]["short_opened_count"] += 1
 
+    def signal_diagnostics_max_rows(self, config):
+        try:
+            return min(500, max(20, int(config.signal_diagnostics_max_rows or 100)))
+        except (TypeError, ValueError):
+            return 100
+
+    def trim_signal_diagnostics(self, config):
+        key = self.debug_key(config)
+        max_rows = self.signal_diagnostics_max_rows(config)
+        rows = self.__class__._signal_diagnostics[key]
+        while len(rows) > max_rows:
+            rows.popleft()
+
     def signal_diagnostics_for(self, config):
         key = self.debug_key(config)
+        self.trim_signal_diagnostics(config)
         return {
             "counters": dict(self.__class__._signal_counters[key]),
             "last_100": list(self.__class__._signal_diagnostics[key]),
         }
+
+    def clear_signal_diagnostics(self, config=None):
+        config = config or self.get_or_create_config()
+        key = self.debug_key(config)
+        self.__class__._signal_diagnostics[key].clear()
+        self.__class__._signal_counters[key] = {
+            "long_signals_count": 0,
+            "short_signals_count": 0,
+            "long_opened_count": 0,
+            "short_opened_count": 0,
+        }
+        return self.response_ok(self.signal_diagnostics_for(config))
 
     def pending_key(self, config):
         return self.debug_key(config)
@@ -2130,6 +2159,7 @@ class OrderBookRecoveryService(Response):
             "min_side_win_rate": config.min_side_win_rate,
             "adaptive_consensus_boost": config.adaptive_consensus_boost,
             "adaptive_min_valid_exchanges_boost": config.adaptive_min_valid_exchanges_boost,
+            "signal_diagnostics_max_rows": self.signal_diagnostics_max_rows(config),
             "paper_equity_usdt": config.paper_equity_usdt,
             "created_at": config.created_at,
             "updated_at": config.updated_at,

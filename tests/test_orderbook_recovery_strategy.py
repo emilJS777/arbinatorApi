@@ -849,6 +849,60 @@ def test_debug_returns_signal_diagnostics_and_counters(client):
     assert debug["signal_diagnostics_last_100"][0]["final_side"] == "long"
 
 
+def test_signal_diagnostics_history_trimmed_to_config_max_rows(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.signal_diagnostics_max_rows = 20
+    db.session.commit()
+
+    for index in range(25):
+        service.record_signal_diagnostic(
+            config,
+            features={"short_momentum": index},
+            proposed_side="long",
+            final_side="none",
+            evaluated_at=datetime.utcnow() + timedelta(seconds=index),
+        )
+
+    diagnostics = service.signal_diagnostics_for(config)
+
+    assert len(diagnostics["last_100"]) == 20
+    assert diagnostics["last_100"][0]["momentum"] == 5
+    assert diagnostics["counters"]["long_signals_count"] == 25
+
+
+def test_signal_diagnostics_clear_endpoint_clears_history_and_counters(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    service.record_signal_diagnostic(config, proposed_side="long", final_side="none")
+    service.record_signal_diagnostic(config, proposed_side="short", final_side="none")
+    service.record_opened_side(config, "long")
+    service.record_opened_side(config, "short")
+
+    response = client.post("/api/orderbook-recovery/diagnostics/clear")
+    payload = response.get_json()["obj"]
+
+    assert response.status_code == 200
+    assert payload["last_100"] == []
+    assert payload["counters"] == {
+        "long_signals_count": 0,
+        "short_signals_count": 0,
+        "long_opened_count": 0,
+        "short_opened_count": 0,
+    }
+
+
+def test_signal_diagnostics_config_max_rows_is_clamped(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+
+    service.update_config({"signal_diagnostics_max_rows": 5})
+    assert service.get_or_create_config().signal_diagnostics_max_rows == 20
+
+    service.update_config({"signal_diagnostics_max_rows": 999})
+    assert service.get_or_create_config().signal_diagnostics_max_rows == 500
+
+
 def test_consensus_no_trade_when_configured_exchange_snapshot_missing(client):
     service = OrderBookRecoveryService()
     config = make_config(service)
@@ -2744,6 +2798,8 @@ def test_frontend_exchange_tpsl_fields_visible():
 
 def test_frontend_entry_mode_controls_exist():
     frontend_view = Path("/Users/emilhambardzumyan/WebstormProjects/arbinator/src/views/orderBookRecovery/v-order-book-recovery.vue").read_text()
+    frontend_api = Path("/Users/emilhambardzumyan/WebstormProjects/arbinator/src/api/orderBookRecovery.js").read_text()
+    frontend_store = Path("/Users/emilhambardzumyan/WebstormProjects/arbinator/src/store/modules/orderBookRecovery.js").read_text()
 
     assert "Entry mode" in frontend_view
     assert "two_step_confirmation" in frontend_view
@@ -2761,6 +2817,10 @@ def test_frontend_entry_mode_controls_exist():
     assert "Live market type" in frontend_view
     assert "Live market valid" in frontend_view
     assert "Live market error" in frontend_view
+    assert "Signal diagnostics max rows" in frontend_view
+    assert "Clear diagnostics" in frontend_view
+    assert "/orderbook-recovery/diagnostics/clear" in frontend_api
+    assert "CLEAR_DIAGNOSTICS" in frontend_store
 
 
 def test_alembic_upgrade_head_succeeds_and_keeps_required_tables(tmp_path):

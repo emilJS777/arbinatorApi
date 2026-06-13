@@ -62,6 +62,7 @@ class OrderBookPatternStrategyConfig(Model, db.Model):
     min_side_win_rate = db.Column(db.Float, default=40, nullable=False)
     adaptive_consensus_boost = db.Column(db.Float, default=0.1, nullable=False)
     adaptive_min_valid_exchanges_boost = db.Column(db.Integer, default=1, nullable=False)
+    signal_diagnostics_max_rows = db.Column(db.Integer, default=100, nullable=False)
     paper_equity_usdt = db.Column(db.Float, default=10000, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

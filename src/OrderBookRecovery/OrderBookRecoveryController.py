@@ -63,6 +63,13 @@ class OrderBookRecoveryDebugController(Controller):
         return self.service.debug_response()
 
 
+class OrderBookRecoveryDiagnosticsClearController(Controller):
+    service = OrderBookRecoveryService()
+
+    def post(self):
+        return self.service.clear_signal_diagnostics()
+
+
 class OrderBookRecoveryForwardTestController(Controller):
     service = OrderBookRecoveryService()
 

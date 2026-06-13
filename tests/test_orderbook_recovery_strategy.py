@@ -199,7 +199,21 @@ class MockMexcSubmitRequests:
             "params": params or {},
             "timeout": timeout,
         })
-        return self.Response(200, '{"success":true,"code":0,"data":{"symbol":"BTC_USDT","contractSize":0.001,"minVol":1,"maxVol":1000000,"volScale":0,"volUnit":1,"apiAllowed":true}}')
+        return self.Response(200, '{"success":true,"code":0,"data":{"symbol":"BTC_USDT","contractSize":0.001,"minVol":1,"maxVol":1000000,"volScale":0,"volUnit":1,"priceScale":2,"priceUnit":0.01,"apiAllowed":true}}')
+
+
+class FailingTpSlRequests(MockMexcSubmitRequests):
+    def request(self, method, url, headers=None, data=None, timeout=None):
+        self.calls.append({
+            "method": method,
+            "url": url,
+            "headers": headers or {},
+            "data": data,
+            "timeout": timeout,
+        })
+        if "planorder/place" in url:
+            return self.Response(200, '{"success":false,"code":500,"message":"plan failed"}')
+        return self.Response(self.status_code, self.text)
 
 
 def prime_momentum(service, config, exchange, symbol="TON/USDT", old_bid=99, old_ask=99.01):
@@ -1797,6 +1811,174 @@ def test_mexc_risk_control_code_has_clear_error(client):
         assert False, "MEXC 6026 should be mapped to a clear error"
 
 
+def test_mexc_long_tpsl_price_calculation(client):
+    service = LiveExecutionService()
+
+    prices = service.calculate_tpsl_prices("long", 100, 10, 2, 0.25, 0.3, {"priceUnit": 0.01})
+
+    assert prices["tp_price"] == 100.12
+    assert prices["sl_price"] == 99.85
+    assert round(prices["price_move_tp_pct"], 3) == 0.125
+    assert round(prices["price_move_sl_pct"], 3) == 0.15
+
+
+def test_mexc_short_tpsl_price_calculation(client):
+    service = LiveExecutionService()
+
+    prices = service.calculate_tpsl_prices("short", 100, 10, 2, 0.25, 0.3, {"priceUnit": 0.01})
+
+    assert prices["tp_price"] == 99.87
+    assert prices["sl_price"] == 100.15
+
+
+def test_mexc_tpsl_price_rounding_by_price_unit(client):
+    service = LiveExecutionService()
+
+    prices = service.calculate_tpsl_prices("long", 123.456, 10, 2, 0.25, 0.3, {"priceUnit": 0.05})
+
+    assert prices["tp_price"] == 123.6
+    assert prices["sl_price"] == 123.25
+
+
+def test_mexc_tpsl_creation_success_stores_order_ids(client):
+    mock_client = MockLiveClient(exchange_id="mexc", markets={
+        "BTC/USDT:USDT": {
+            "id": "BTC_USDT",
+            "symbol": "BTC/USDT:USDT",
+            "type": "swap",
+            "swap": True,
+            "contract": True,
+            "linear": True,
+            "base": "BTC",
+            "quote": "USDT",
+            "settle": "USDT",
+            "contractSize": 0.001,
+        },
+    })
+    requests_client = MockMexcSubmitRequests()
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client, requests_client=requests_client))
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "BTC/USDT"
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    config.take_profit_percent_of_margin = 0.25
+    config.stop_loss_percent_of_margin = 0.3
+    config.feedback_enabled = False
+    db.session.commit()
+    for source_exchange in ["Mexc", "Binance", "Bybit"]:
+        prime_momentum(service, config, source_exchange, symbol="BTC/USDT")
+        add_snapshot(source_exchange, symbol="BTC/USDT", bid=100, ask=100.01, bid_amount=10, ask_amount=5)
+
+    result = service.evaluate(config)
+    trade = StrategyRunTrade.query.first()
+    plan_calls = [call for call in requests_client.calls if "planorder/place/v2" in call["url"]]
+
+    assert result["tp_sl_protected"] is True
+    assert trade.tp_sl_protected is True
+    assert trade.exchange_tp_order_id == "contract-order-1"
+    assert trade.exchange_sl_order_id == "contract-order-1"
+    assert trade.exchange_tp_price is not None
+    assert trade.exchange_sl_price is not None
+    assert len(plan_calls) == 2
+    assert all(json.loads(call["data"])["side"] == 4 for call in plan_calls)
+
+
+def test_mexc_tpsl_creation_failure_marks_trade_unprotected(client):
+    mock_client = MockLiveClient(exchange_id="mexc", markets={
+        "BTC/USDT:USDT": {
+            "id": "BTC_USDT",
+            "symbol": "BTC/USDT:USDT",
+            "type": "swap",
+            "swap": True,
+            "contract": True,
+            "linear": True,
+            "base": "BTC",
+            "quote": "USDT",
+            "settle": "USDT",
+            "contractSize": 0.001,
+        },
+    })
+    requests_client = FailingTpSlRequests()
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client, requests_client=requests_client))
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "BTC/USDT"
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    config.feedback_enabled = False
+    db.session.commit()
+    for source_exchange in ["Mexc", "Binance", "Bybit"]:
+        prime_momentum(service, config, source_exchange, symbol="BTC/USDT")
+        add_snapshot(source_exchange, symbol="BTC/USDT", bid=100, ask=100.01, bid_amount=10, ask_amount=5)
+
+    result = service.evaluate(config)
+    trade = StrategyRunTrade.query.first()
+
+    assert result["live_status"] == "tp_sl_unprotected"
+    assert trade.closed_at is None
+    assert trade.tp_sl_protected is False
+    assert "live_mexc_order_failed" in trade.tp_sl_error
+
+
+def test_manual_close_cancels_mexc_tpsl_orders(client):
+    mock_client = MockLiveClient(exchange_id="mexc", markets={
+        "BTC/USDT:USDT": {
+            "id": "BTC_USDT",
+            "symbol": "BTC/USDT:USDT",
+            "type": "swap",
+            "swap": True,
+            "contract": True,
+            "linear": True,
+            "base": "BTC",
+            "quote": "USDT",
+            "settle": "USDT",
+            "contractSize": 0.001,
+        },
+    })
+    requests_client = MockMexcSubmitRequests()
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client, requests_client=requests_client))
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.exchange_id = exchange.id
+    config.symbol = "BTC/USDT"
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    config.feedback_enabled = False
+    db.session.commit()
+    for source_exchange in ["Mexc", "Binance", "Bybit"]:
+        prime_momentum(service, config, source_exchange, symbol="BTC/USDT")
+        add_snapshot(source_exchange, symbol="BTC/USDT", bid=100, ask=100.01, bid_amount=10, ask_amount=5)
+    service.evaluate(config)
+    trade = StrategyRunTrade.query.first()
+
+    response = service.close_manual(trade.id, {"reason": "manual_close"})
+    cancel_calls = [call for call in requests_client.calls if "planorder/cancel" in call["url"]]
+
+    assert response.status_code == 200
+    assert len(cancel_calls) == 2
+
+
+def test_tpsl_does_not_affect_paper_mode(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+
+    trade_payload = open_trade(service, config, "long", 100)
+    trade = StrategyRunTrade.query.first()
+
+    assert trade_payload["execution_mode"] == "paper"
+    assert trade.tp_sl_protected is False
+    assert trade.exchange_tp_order_id is None
+
+
 def test_mexc_client_uses_swap_options(client):
     captured = {}
 
@@ -2378,6 +2560,19 @@ def test_frontend_export_api_method_exists():
     assert "No non-archived closed trades to export" in frontend_view
     assert "exportTrades" in frontend_api
     assert "/orderbook-recovery/trades/export" in frontend_api
+
+
+def test_frontend_exchange_tpsl_fields_visible():
+    frontend_view = Path("/Users/emilhambardzumyan/WebstormProjects/arbinator/src/views/orderBookRecovery/v-order-book-recovery.vue").read_text()
+
+    assert "TP/SL protected" in frontend_view
+    assert "Exchange TP/SL not created" in frontend_view
+    assert "tp_sl_protected" in frontend_view
+    assert "exchange_tp_price" in frontend_view
+    assert "exchange_sl_price" in frontend_view
+    assert "exchange_tp_order_id" in frontend_view
+    assert "exchange_sl_order_id" in frontend_view
+    assert "tp_sl_error" in frontend_view
 
 
 def test_frontend_entry_mode_controls_exist():

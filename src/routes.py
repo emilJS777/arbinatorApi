@@ -4,9 +4,10 @@ from src.Health.HealthController import HealthController, ReadinessController
 api.add_resource(HealthController, "/healthz")
 api.add_resource(ReadinessController, "/readyz")
 
-from src.Live.LiveDiagnosticsController import MexcDiagnosticsController, MexcOrderSubmitDryCheckController
+from src.Live.LiveDiagnosticsController import MexcDiagnosticsController, MexcOrderSubmitDryCheckController, MexcTpSlDryCheckController
 api.add_resource(MexcDiagnosticsController, "/api/live/mexc-diagnostics")
 api.add_resource(MexcOrderSubmitDryCheckController, "/api/live/mexc-order-submit-drycheck")
+api.add_resource(MexcTpSlDryCheckController, "/api/live/mexc-tpsl-drycheck")
 
 from src.Exchange.ExchangeController import ExchangeController
 api.add_resource(ExchangeController, "/api/exchange")

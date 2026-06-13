@@ -521,6 +521,7 @@ class OrderBookRecoveryService(Response):
             "configured_exchange_imbalance", "configured_exchange_spread", "configured_exchange_momentum", "entry_reason",
             "entry_mode", "confirmation_delay_actual_seconds", "first_signal_snapshot_json", "confirmation_snapshot_json",
             "execution_mode", "live_status", "live_exchange_order_id", "live_close_order_id", "live_entry_fee", "live_exit_fee", "live_error",
+            "exchange_tp_order_id", "exchange_sl_order_id", "exchange_tp_price", "exchange_sl_price", "tp_sl_protected", "tp_sl_error", "tp_sl_created_at",
             "feedback_enabled", "long_recent_win_rate", "short_recent_win_rate", "long_loss_streak", "short_loss_streak",
             "adaptive_min_consensus_ratio", "adaptive_min_valid_exchanges", "blocked_side", "feedback_reject_reason",
             "exchange", "symbol", "base_margin_usdt", "leverage_config", "tp_percent_of_margin", "sl_percent_of_margin",
@@ -581,6 +582,13 @@ class OrderBookRecoveryService(Response):
             "live_entry_fee": trade.live_entry_fee,
             "live_exit_fee": trade.live_exit_fee,
             "live_error": trade.live_error,
+            "exchange_tp_order_id": trade.exchange_tp_order_id,
+            "exchange_sl_order_id": trade.exchange_sl_order_id,
+            "exchange_tp_price": trade.exchange_tp_price,
+            "exchange_sl_price": trade.exchange_sl_price,
+            "tp_sl_protected": trade.tp_sl_protected,
+            "tp_sl_error": trade.tp_sl_error,
+            "tp_sl_created_at": trade.tp_sl_created_at,
             "feedback_enabled": feedback.get("feedback_enabled"),
             "long_recent_win_rate": feedback.get("long_recent_win_rate"),
             "short_recent_win_rate": feedback.get("short_recent_win_rate"),
@@ -1493,6 +1501,8 @@ class OrderBookRecoveryService(Response):
                 notional = entry_price * amount
             except Exception as error:
                 live_error = str(error)
+        tpsl = (live_result or {}).get("tpsl") or {}
+        tpsl_error = (live_result or {}).get("tpsl_error")
         entry_reason = f"side={side}, consensus={consensus.get('consensus_direction')}, imbalance={features['imbalance']:.4f}, momentum={features['short_momentum']:.8f}, spread={features['spread_percent']:.4f}"
         if consensus.get("entry_mode") == "two_step_confirmation":
             entry_reason = (
@@ -1567,9 +1577,16 @@ class OrderBookRecoveryService(Response):
             live_entry_price=live_result.get("average_fill_price") if live_result else None,
             live_filled_amount=live_result.get("filled_amount") if live_result else None,
             live_entry_fee=live_result.get("fee") if live_result else None,
-            live_status=("open" if live_result else ("open_failed" if live_error else None)),
-            live_error=live_error or (live_result.get("warning") if live_result else None),
+            live_status=(live_result.get("status") if live_result else ("open_failed" if live_error else None)),
+            live_error=live_error or tpsl_error or (live_result.get("warning") if live_result else None),
             live_raw_open_response_json=self.live_execution_service.raw_json(live_result.get("raw_response")) if live_result else None,
+            exchange_tp_order_id=tpsl.get("tp_order_id"),
+            exchange_sl_order_id=tpsl.get("sl_order_id"),
+            exchange_tp_price=tpsl.get("tp_price"),
+            exchange_sl_price=tpsl.get("sl_price"),
+            tp_sl_protected=bool(tpsl and not tpsl_error),
+            tp_sl_error=tpsl_error,
+            tp_sl_created_at=tpsl.get("created_at"),
         )
         state.last_opened_at = current_time
         db.session.add(trade)
@@ -1585,6 +1602,13 @@ class OrderBookRecoveryService(Response):
     def evaluate_open_trade(self, trade, current_price: float, state, config, current_time):
         pnl = self.calculate_pnl(trade.side, trade.entry_price, current_price, trade.notional)
         trade.pnl = pnl
+        if trade.execution_mode == "live" and trade.tp_sl_protected:
+            try:
+                if not self.live_execution_service.position_is_open(config, trade):
+                    reason = self.exchange_tpsl_close_reason(trade, current_price)
+                    return self.close_exchange_closed_trade(trade, current_price, pnl, reason, state, config, current_time)
+            except Exception as error:
+                trade.live_error = str(error)
         target_profit = trade.margin * (float(config.take_profit_percent_of_margin) / 100)
         max_loss = trade.margin * (float(config.stop_loss_percent_of_margin) / 100)
         if pnl >= target_profit:
@@ -1593,6 +1617,35 @@ class OrderBookRecoveryService(Response):
             return self.close_trade(trade, current_price, pnl, "stop_loss", state, config, current_time)
         db.session.commit()
         return None
+
+    def exchange_tpsl_close_reason(self, trade, current_price):
+        if trade.side == "long":
+            if trade.exchange_tp_price and current_price >= trade.exchange_tp_price:
+                return "exchange_take_profit"
+            if trade.exchange_sl_price and current_price <= trade.exchange_sl_price:
+                return "exchange_stop_loss"
+        else:
+            if trade.exchange_tp_price and current_price <= trade.exchange_tp_price:
+                return "exchange_take_profit"
+            if trade.exchange_sl_price and current_price >= trade.exchange_sl_price:
+                return "exchange_stop_loss"
+        return "exchange_position_closed"
+
+    def close_exchange_closed_trade(self, trade, exit_price, pnl, reason, state, config, current_time):
+        trade.exit_price = exit_price
+        trade.pnl = pnl
+        trade.result = "win" if pnl > 0 else "loss"
+        trade.reason_close = reason
+        trade.closed_at = current_time
+        trade.live_exit_price = exit_price
+        trade.live_status = "closed"
+        trade.holding_seconds = (trade.closed_at - trade.opened_at).total_seconds() if trade.opened_at else None
+        self.apply_recovery_after_close(state, config, trade.result, current_time)
+        db.session.commit()
+        payload = self.trade_to_dict(trade)
+        logger.info("OrderBookRecovery exchange-side position closed: trade_id=%s reason=%s pnl=%s", trade.id, reason, pnl)
+        self.publisher.publish("orderbook_recovery.position_closed", payload)
+        return payload
 
     def close_trade(self, trade, exit_price, pnl, reason, state, config, current_time):
         if trade.execution_mode == "live":
@@ -1607,6 +1660,9 @@ class OrderBookRecoveryService(Response):
                 trade.live_exit_fee = live_result.get("fee")
                 trade.live_status = "closed"
                 trade.live_raw_close_response_json = self.live_execution_service.raw_json(live_result.get("raw_response"))
+                tpsl_cancel = live_result.get("tpsl_cancel") or {}
+                if tpsl_cancel.get("errors"):
+                    trade.tp_sl_error = "; ".join(tpsl_cancel["errors"])
                 if live_result.get("warning"):
                     trade.live_error = live_result["warning"]
             except Exception as error:
@@ -2016,6 +2072,13 @@ class OrderBookRecoveryService(Response):
             "live_error": trade.live_error,
             "live_raw_open_response_json": trade.live_raw_open_response_json,
             "live_raw_close_response_json": trade.live_raw_close_response_json,
+            "exchange_tp_order_id": trade.exchange_tp_order_id,
+            "exchange_sl_order_id": trade.exchange_sl_order_id,
+            "exchange_tp_price": trade.exchange_tp_price,
+            "exchange_sl_price": trade.exchange_sl_price,
+            "tp_sl_protected": trade.tp_sl_protected,
+            "tp_sl_error": trade.tp_sl_error,
+            "tp_sl_created_at": trade.tp_sl_created_at,
             "holding_seconds": trade.holding_seconds,
         }
 

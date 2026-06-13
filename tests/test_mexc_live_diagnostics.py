@@ -4,6 +4,7 @@ import json
 from src.Exchange.ExchangeModel import Exchange
 from src.Live.MexcDiagnosticsService import MexcDiagnosticsService
 from src.Live.MexcOrderSubmitDryCheckService import MexcOrderSubmitDryCheckService
+from src.Live.MexcTpSlDryCheckService import MexcTpSlDryCheckService
 from src.OrderBookRecovery.LiveExecutionService import LiveExecutionService
 
 
@@ -66,7 +67,7 @@ class FakeOrderSubmitRequests:
             "timeout": timeout,
         })
         if "contract/detail" in url:
-            return FakeResponse(200, '{"success":true,"code":0,"data":{"symbol":"BTC_USDT","contractSize":0.001,"minVol":1,"maxVol":1000000,"volScale":0,"volUnit":1,"apiAllowed":true}}')
+            return FakeResponse(200, '{"success":true,"code":0,"data":{"symbol":"BTC_USDT","contractSize":0.001,"minVol":1,"maxVol":1000000,"volScale":0,"volUnit":1,"priceScale":2,"priceUnit":0.01,"apiAllowed":true}}')
         return FakeResponse(404, "not found")
 
 
@@ -578,3 +579,57 @@ def test_mexc_order_submit_rejects_below_min_contract_volume(client):
 
     assert response.status_code == 400
     assert "live_mexc_order_below_min_vol" in response.get_json()["obj"]["msg"]
+
+
+def test_mexc_tpsl_drycheck_returns_calculated_requests_without_submit(client):
+    seed_mexc()
+    requests_client = FakeOrderSubmitRequests()
+    service = MexcTpSlDryCheckService(
+        live_execution_service=LiveExecutionService(client_factory=lambda _exchange: FakeMexcClient({"apiKey": "api-key-value", "secret": "secret-value"}), requests_client=requests_client)
+    )
+
+    payload = service.run({
+        "symbol": "BTC/USDT",
+        "side": "long",
+        "margin_usdt": 10,
+        "leverage": 2,
+        "entry_price": 100,
+        "take_profit_percent_of_margin": 0.25,
+        "stop_loss_percent_of_margin": 0.3,
+    }).get_json()["obj"]
+
+    assert payload["dry_run"] is True
+    assert len(requests_client.calls) == 1
+    assert requests_client.calls[0]["method"] == "GET"
+    assert payload["calculated"]["tp_price"] == 100.12
+    assert payload["calculated"]["sl_price"] == 99.85
+    assert payload["tp_request"]["endpoint"] == "https://api.mexc.com/api/v1/private/planorder/place/v2"
+    assert payload["sl_request"]["endpoint"] == "https://api.mexc.com/api/v1/private/planorder/place/v2"
+    assert payload["tp_request"]["body"]["side"] == 4
+    assert payload["sl_request"]["body"]["side"] == 4
+    assert payload["tp_request"]["body"]["triggerType"] == 1
+    assert payload["sl_request"]["body"]["triggerType"] == 2
+
+
+def test_mexc_tpsl_drycheck_route(client, monkeypatch):
+    seed_mexc()
+    fake_ccxt = FakeCcxt()
+    fake_requests = FakeOrderSubmitRequests()
+    monkeypatch.setattr("src.OrderBookRecovery.LiveExecutionService.ccxt", fake_ccxt)
+    monkeypatch.setattr("src.OrderBookRecovery.LiveExecutionService.requests", fake_requests)
+
+    response = client.post("/api/live/mexc-tpsl-drycheck", json={
+        "symbol": "BTC/USDT",
+        "side": "short",
+        "margin_usdt": 10,
+        "leverage": 2,
+        "entry_price": 100,
+        "take_profit_percent_of_margin": 0.25,
+        "stop_loss_percent_of_margin": 0.3,
+    })
+    payload = response.get_json()["obj"]
+
+    assert response.status_code == 200
+    assert payload["dry_run"] is True
+    assert payload["tp_request"]["body"]["side"] == 2
+    assert payload["sl_request"]["body"]["side"] == 2

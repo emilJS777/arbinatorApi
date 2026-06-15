@@ -1,8 +1,9 @@
 import logging
 import os
+import time
 from datetime import datetime
 
-from flask import Flask
+from flask import Flask, g, request
 from flask_cors import CORS
 from flask_migrate import Migrate
 from flask_restful import Api
@@ -47,6 +48,34 @@ def cleanup_db_session(_exception=None):
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, log_level, logging.INFO))
 logger = logging.getLogger(f"{datetime.utcnow()}")
+request_timing_logger = logging.getLogger("arbinator.request_timing")
+TIMED_REQUEST_PATHS = {
+    "/api/orderbook-recovery/metrics",
+    "/api/orderbook-recovery/debug",
+    "/api/orderbook-recovery/trades",
+    "/api/scanner/diagnostics",
+}
+
+
+@app.before_request
+def mark_timed_request_start():
+    if request.path in TIMED_REQUEST_PATHS:
+        g.request_started_at = time.perf_counter()
+
+
+@app.after_request
+def log_timed_request(response):
+    started_at = getattr(g, "request_started_at", None)
+    if started_at is not None:
+        duration_ms = (time.perf_counter() - started_at) * 1000
+        request_timing_logger.info(
+            "request_timing path=%s method=%s status=%s duration_ms=%.2f",
+            request.path,
+            request.method,
+            response.status_code,
+            duration_ms,
+        )
+    return response
 
 # Set CORS options on app configuration
 allowed_origins = os.getenv("CORS_ALLOWED_ORIGINS", DEFAULT_ALLOWED_ORIGINS)

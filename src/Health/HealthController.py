@@ -11,5 +11,8 @@ class HealthController(Controller):
 
 class ReadinessController(Controller):
     def get(self):
-        db.session.execute(text("SELECT 1"))
+        try:
+            db.session.execute(text("SELECT 1"))
+        finally:
+            db.session.remove()
         return {"status": "ok"}

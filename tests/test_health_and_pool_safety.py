@@ -1,3 +1,8 @@
+import os
+from pathlib import Path
+
+import pytest
+
 from src import db
 from src.config import build_sqlalchemy_engine_options
 from src.Exchange.ExchangeModel import Exchange
@@ -32,6 +37,7 @@ def test_readyz_performs_lightweight_select(client, monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {"status": "ok"}
     assert any("SELECT 1" in statement for statement in calls)
+    assert len(calls) == 1
 
 
 def test_request_teardown_removes_scoped_session(client, monkeypatch):
@@ -79,6 +85,20 @@ def test_orderbook_read_endpoints_do_not_call_exchange_apis(client, monkeypatch)
         assert response.status_code == 200
 
 
+def test_request_timing_logs_for_heavy_polling_endpoints(client, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="arbinator.request_timing")
+
+    response = client.get("/api/orderbook-recovery/metrics")
+
+    assert response.status_code == 200
+    assert any(
+        "request_timing path=/api/orderbook-recovery/metrics" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_repeated_orderbook_polling_releases_sessions(client, monkeypatch):
     calls = []
     original_remove = db.session.remove
@@ -105,3 +125,15 @@ def test_postgres_pool_options_are_configured():
     assert options["pool_timeout"] == 5
     assert options["pool_pre_ping"] is True
     assert options["pool_recycle"] == 1800
+
+
+def test_k8s_backend_manifest_uses_lightweight_probes():
+    manifest_path = Path(os.getenv("K8S_BACKEND_MANIFEST", "/root/arbinator/k8s/backend.yaml"))
+    if not manifest_path.exists():
+        pytest.skip("k8s backend manifest is not present in this local workspace")
+    manifest = manifest_path.read_text()
+
+    assert "readinessProbe:" in manifest
+    assert "path: /readyz" in manifest
+    assert "path: /healthz" in manifest
+    assert "path: /api/orderbook-recovery/metrics" not in manifest

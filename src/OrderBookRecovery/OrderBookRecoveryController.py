@@ -70,6 +70,20 @@ class OrderBookRecoveryDiagnosticsClearController(Controller):
         return self.service.clear_signal_diagnostics()
 
 
+class OrderBookRecoveryRecoveryResetController(Controller):
+    service = OrderBookRecoveryService()
+
+    def post(self):
+        return self.service.reset_recovery()
+
+
+class OrderBookRecoverySetCurrentMarginController(Controller):
+    service = OrderBookRecoveryService()
+
+    def post(self):
+        return self.service.set_current_margin(self.request.get_json() or {})
+
+
 class OrderBookRecoveryForwardTestController(Controller):
     service = OrderBookRecoveryService()
 

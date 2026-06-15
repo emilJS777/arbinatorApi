@@ -82,6 +82,9 @@ class RecoveryState(Model, db.Model):
     paused_until = db.Column(db.DateTime, nullable=True)
     last_closed_at = db.Column(db.DateTime, nullable=True)
     last_opened_at = db.Column(db.DateTime, nullable=True)
+    last_manual_recovery_reset_at = db.Column(db.DateTime, nullable=True)
+    last_manual_margin_override_at = db.Column(db.DateTime, nullable=True)
+    last_manual_margin_override_value = db.Column(db.Float, nullable=True)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 

@@ -315,6 +315,63 @@ class OrderBookRecoveryService(Response):
         self.publisher.publish("orderbook_recovery.stopped", payload)
         return self.response_ok(payload)
 
+    def margin_related_stop_reason(self, reason):
+        return reason in {
+            "current_margin_exceeds_available_paper_equity",
+            "live_margin_exceeds_limit",
+            "margin_limit_exceeded",
+            "insufficient_balance",
+            "live_balance_insufficient",
+            "max_recovery_pause",
+        }
+
+    def clear_margin_related_pause(self, state):
+        if self.margin_related_stop_reason(state.stop_reason):
+            state.is_stopped = False
+            state.stop_reason = None
+            state.paused_until = None
+
+    def reset_recovery(self):
+        config = self.get_or_create_config()
+        state = self.get_or_create_state(config)
+        if self.open_trade(config):
+            return self.response(False, {"msg": "cannot_change_margin_with_open_position"}, 400)
+        state.current_step = 0
+        state.current_margin = config.base_margin_usdt
+        state.consecutive_losses = 0
+        state.last_trade_result = None
+        state.last_manual_recovery_reset_at = datetime.utcnow()
+        self.clear_margin_related_pause(state)
+        db.session.commit()
+        logger.info("OrderBookRecovery recovery reset manually: exchange=%s symbol=%s margin=%s", config.exchange, config.symbol, state.current_margin)
+        return self.response_ok(self.state_payload(config, state))
+
+    def set_current_margin(self, body: dict):
+        config = self.get_or_create_config()
+        state = self.get_or_create_state(config)
+        if self.open_trade(config):
+            return self.response(False, {"msg": "cannot_change_margin_with_open_position"}, 400)
+        try:
+            current_margin = float(body.get("current_margin"))
+        except (TypeError, ValueError):
+            return self.response(False, {"msg": "invalid_current_margin"}, 400)
+        if current_margin <= 0:
+            return self.response(False, {"msg": "invalid_current_margin"}, 400)
+        if config.execution_mode == "live" and current_margin > float(config.live_max_margin_usdt):
+            return self.response(False, {"msg": "live_margin_exceeds_limit"}, 400)
+        state.current_step = 0
+        state.current_margin = current_margin
+        state.consecutive_losses = 0
+        state.last_trade_result = None
+        state.stop_reason = "manual_margin_override"
+        state.paused_until = None
+        state.is_stopped = False
+        state.last_manual_margin_override_at = datetime.utcnow()
+        state.last_manual_margin_override_value = current_margin
+        db.session.commit()
+        logger.info("OrderBookRecovery current margin overridden manually: exchange=%s symbol=%s margin=%s", config.exchange, config.symbol, current_margin)
+        return self.response_ok(self.state_payload(config, state))
+
     def state_response(self):
         config = self.get_or_create_config()
         state = self.get_or_create_state(config)
@@ -2282,6 +2339,9 @@ class OrderBookRecoveryService(Response):
             "paused_until": state.paused_until,
             "last_closed_at": state.last_closed_at,
             "last_opened_at": state.last_opened_at,
+            "last_manual_recovery_reset_at": state.last_manual_recovery_reset_at,
+            "last_manual_margin_override_at": state.last_manual_margin_override_at,
+            "last_manual_margin_override_value": state.last_manual_margin_override_value,
             "updated_at": state.updated_at,
         }
 

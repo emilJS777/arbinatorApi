@@ -583,6 +583,95 @@ def test_win_on_any_step_resets_to_step_zero(client):
     assert state.consecutive_losses == 0
 
 
+def test_manual_recovery_reset_sets_step_zero_and_base_margin(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    state = service.get_or_create_state(config)
+    state.current_step = 2
+    state.current_margin = 28
+    state.consecutive_losses = 2
+    state.last_trade_result = "loss"
+    db.session.commit()
+
+    response = client.post("/api/orderbook-recovery/recovery/reset", json={})
+    state = service.get_or_create_state(config)
+
+    assert response.status_code == 200
+    assert state.current_step == 0
+    assert state.current_margin == config.base_margin_usdt
+    assert state.consecutive_losses == 0
+    assert state.last_trade_result is None
+    assert state.last_manual_recovery_reset_at is not None
+
+
+def test_manual_set_current_margin_validates_live_max_margin(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.execution_mode = "live"
+    config.live_max_margin_usdt = 5
+    db.session.commit()
+
+    response = client.post("/api/orderbook-recovery/recovery/set-current-margin", json={"current_margin": 10})
+
+    assert response.status_code == 400
+    assert response.get_json()["obj"]["msg"] == "live_margin_exceeds_limit"
+
+
+def test_manual_recovery_change_blocked_while_position_open(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    open_trade(service, config)
+
+    reset_response = client.post("/api/orderbook-recovery/recovery/reset", json={})
+    margin_response = client.post("/api/orderbook-recovery/recovery/set-current-margin", json={"current_margin": 10})
+
+    assert reset_response.status_code == 400
+    assert reset_response.get_json()["obj"]["msg"] == "cannot_change_margin_with_open_position"
+    assert margin_response.status_code == 400
+    assert margin_response.get_json()["obj"]["msg"] == "cannot_change_margin_with_open_position"
+
+
+def test_manual_recovery_reset_clears_margin_related_stop_reason(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    state = service.get_or_create_state(config)
+    state.is_stopped = True
+    state.stop_reason = "current_margin_exceeds_available_paper_equity"
+    state.paused_until = datetime.utcnow() + timedelta(minutes=5)
+    state.current_step = 2
+    state.current_margin = 28
+    db.session.commit()
+
+    response = client.post("/api/orderbook-recovery/recovery/reset", json={})
+    state = service.get_or_create_state(config)
+
+    assert response.status_code == 200
+    assert state.is_stopped is False
+    assert state.stop_reason is None
+    assert state.paused_until is None
+
+
+def test_manual_set_current_margin_updates_audit_and_resets_losses(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    state = service.get_or_create_state(config)
+    state.current_step = 2
+    state.current_margin = 28
+    state.consecutive_losses = 2
+    db.session.commit()
+
+    response = client.post("/api/orderbook-recovery/recovery/set-current-margin", json={"current_margin": 10})
+    state = service.get_or_create_state(config)
+
+    assert response.status_code == 200
+    assert state.current_step == 0
+    assert state.current_margin == 10
+    assert state.consecutive_losses == 0
+    assert state.stop_reason == "manual_margin_override"
+    assert state.last_manual_margin_override_at is not None
+    assert state.last_manual_margin_override_value == 10
+
+
 def test_strategy_stops_after_max_recovery_steps(client):
     service = OrderBookRecoveryService()
     config = make_config(service)
@@ -2931,6 +3020,12 @@ def test_frontend_entry_mode_controls_exist():
     assert "Clear diagnostics" in frontend_view
     assert "/orderbook-recovery/diagnostics/clear" in frontend_api
     assert "CLEAR_DIAGNOSTICS" in frontend_store
+    assert "Reset recovery to base margin" in frontend_view
+    assert "Set current margin" in frontend_view
+    assert "/orderbook-recovery/recovery/reset" in frontend_api
+    assert "/orderbook-recovery/recovery/set-current-margin" in frontend_api
+    assert "RESET_RECOVERY" in frontend_store
+    assert "SET_CURRENT_MARGIN" in frontend_store
 
 
 def test_alembic_upgrade_head_succeeds_and_keeps_required_tables(tmp_path):

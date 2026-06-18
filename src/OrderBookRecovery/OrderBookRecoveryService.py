@@ -182,6 +182,12 @@ class OrderBookRecoveryService(Response):
             "live_order_type",
             "live_reduce_only_close",
             "live_open_failed_cooldown_seconds",
+            "live_fee_filter_enabled",
+            "live_fee_filter_taker_fee_percent",
+            "momentum_confirmation_enabled",
+            "side_quality_filter_enabled",
+            "side_quality_lookback_trades",
+            "side_quality_cooldown_seconds",
             "cooldown_after_max_recovery_seconds",
             "feedback_enabled",
             "feedback_lookback_trades",
@@ -202,6 +208,9 @@ class OrderBookRecoveryService(Response):
             config.execution_mode = "paper"
         if config.live_order_type not in {"market", "limit"}:
             config.live_order_type = "market"
+        config.live_fee_filter_taker_fee_percent = max(0, float(config.live_fee_filter_taker_fee_percent or 0))
+        config.side_quality_lookback_trades = max(1, int(config.side_quality_lookback_trades or 5))
+        config.side_quality_cooldown_seconds = max(0, int(config.side_quality_cooldown_seconds or 0))
         config.signal_diagnostics_max_rows = min(500, max(20, int(config.signal_diagnostics_max_rows or 100)))
         config.paper_mode_only = True
 
@@ -587,7 +596,7 @@ class OrderBookRecoveryService(Response):
     def export_fields(self):
         return [
             "id", "side", "recovery_step", "margin", "leverage", "notional", "entry_price", "exit_price",
-            "pnl", "result", "close_reason", "opened_at", "closed_at", "holding_seconds",
+            "pnl", "gross_pnl", "net_pnl", "total_fee", "result", "close_reason", "opened_at", "closed_at", "holding_seconds",
             "consensus_direction", "valid_exchanges_count", "confirming_long_count", "confirming_short_count",
             "consensus_ratio_long", "consensus_ratio_short", "average_imbalance", "average_momentum",
             "median_imbalance", "raw_average_imbalance", "anomalous_exchanges_count",
@@ -619,6 +628,9 @@ class OrderBookRecoveryService(Response):
             "entry_price": trade.entry_price,
             "exit_price": trade.exit_price,
             "pnl": trade.pnl,
+            "gross_pnl": trade.gross_pnl,
+            "net_pnl": trade.net_pnl,
+            "total_fee": trade.total_fee,
             "result": trade.result,
             "close_reason": trade.reason_close,
             "opened_at": trade.opened_at,
@@ -816,6 +828,11 @@ class OrderBookRecoveryService(Response):
             signal = None
             consensus["reject_reason"] = feedback["feedback_reject_reason"]
         consensus["feedback"] = feedback
+        if signal:
+            protection_reject_reason = self.profit_protection_rejection(config, state, features, signal, consensus, current_time)
+            if protection_reject_reason:
+                signal = None
+                consensus["reject_reason"] = protection_reject_reason
         reject_reason = consensus.get("reject_reason") or (self.risk_rejection(config, state, features, current_time) if not signal else None)
         if config.entry_mode == "two_step_confirmation":
             return self.handle_two_step_entry(config, state, features, long_signal, short_signal, signal, consensus, reject_reason, current_time)
@@ -1029,6 +1046,7 @@ class OrderBookRecoveryService(Response):
             "proposed_side": proposed_side,
             "final_side": final_side,
             "reject_reason": reject_reason or consensus.get("reject_reason"),
+            "skip_reason": self.entry_skip_reason(reject_reason or consensus.get("reject_reason")),
             "blocked_side": feedback.get("blocked_side"),
             "long_win_rate": feedback.get("long_recent_win_rate"),
             "short_win_rate": feedback.get("short_recent_win_rate"),
@@ -1036,6 +1054,7 @@ class OrderBookRecoveryService(Response):
             "short_signal": bool(short_signal),
             "consensus_direction": consensus.get("consensus_direction"),
             "feedback_reject_reason": feedback.get("feedback_reject_reason"),
+            "profit_protection": consensus.get("profit_protection") or {},
             **audit,
         }
         self.__class__._signal_diagnostics[key].append(row)
@@ -1109,6 +1128,89 @@ class OrderBookRecoveryService(Response):
             "final_short_count": 0,
         }
         return self.response_ok(self.signal_diagnostics_for(config))
+
+    def entry_skip_reason(self, reject_reason):
+        if not reject_reason:
+            return None
+        if str(reject_reason).startswith("confirmation_failed") or reject_reason == "confirmation_expired":
+            return "failed_confirmation"
+        if reject_reason in {"fee_filter", "weak_momentum", "side_quality_block"}:
+            return reject_reason
+        return None
+
+    def live_fee_filter_result(self, config, state):
+        margin = float(state.current_margin or config.base_margin_usdt or 0)
+        leverage = float(config.leverage or 1)
+        notional = margin * leverage
+        taker_fee_percent = float(config.live_fee_filter_taker_fee_percent or 0)
+        roundtrip_fee = notional * (taker_fee_percent / 100) * 2
+        target_profit = margin * (float(config.take_profit_percent_of_margin or 0) / 100)
+        return {
+            "enabled": bool(config.live_fee_filter_enabled and config.execution_mode == "live"),
+            "current_margin": margin,
+            "estimated_notional": notional,
+            "taker_fee_percent": taker_fee_percent,
+            "estimated_roundtrip_fee": roundtrip_fee,
+            "target_profit_pnl": target_profit,
+            "required_min_target_pnl": roundtrip_fee * 2,
+            "passes": target_profit >= (roundtrip_fee * 2),
+        }
+
+    def side_quality_filter_result(self, config, side, current_time):
+        result = {
+            "enabled": bool(config.side_quality_filter_enabled),
+            "side": side,
+            "lookback": int(config.side_quality_lookback_trades or 5),
+            "cooldown_seconds": int(config.side_quality_cooldown_seconds or 0),
+            "recent_count": 0,
+            "recent_net_pnl": 0,
+            "cooldown_until": None,
+            "passes": True,
+        }
+        if not config.side_quality_filter_enabled or not side:
+            return result
+        trades = (
+            StrategyRunTrade.query.filter(
+                StrategyRunTrade.strategy_config_id == config.id,
+                StrategyRunTrade.side == side,
+                StrategyRunTrade.closed_at.isnot(None),
+                StrategyRunTrade.is_archived.is_(False),
+                or_(StrategyRunTrade.live_status.is_(None), StrategyRunTrade.live_status != "open_failed"),
+            )
+            .order_by(StrategyRunTrade.closed_at.desc())
+            .limit(result["lookback"])
+            .all()
+        )
+        net_values = [float((trade.net_pnl if trade.net_pnl is not None else trade.pnl) or 0) for trade in trades]
+        result["recent_count"] = len(net_values)
+        result["recent_net_pnl"] = sum(net_values)
+        latest = trades[0] if trades else None
+        if len(net_values) >= result["lookback"] and result["recent_net_pnl"] < 0 and latest and latest.closed_at:
+            cooldown_until = latest.closed_at + timedelta(seconds=result["cooldown_seconds"])
+            result["cooldown_until"] = cooldown_until
+            if current_time < cooldown_until:
+                result["passes"] = False
+        return result
+
+    def profit_protection_rejection(self, config, state, features, signal, consensus, current_time):
+        protection = {
+            "fee_filter": self.live_fee_filter_result(config, state),
+            "momentum_confirmation_enabled": bool(config.momentum_confirmation_enabled),
+            "side_quality": self.side_quality_filter_result(config, signal, current_time),
+            "reject_reason": None,
+        }
+        if protection["fee_filter"]["enabled"] and not protection["fee_filter"]["passes"]:
+            protection["reject_reason"] = "fee_filter"
+        momentum = consensus.get("average_momentum", features.get("short_momentum"))
+        if signal and config.momentum_confirmation_enabled:
+            if signal == "long" and (momentum is None or momentum <= 0):
+                protection["reject_reason"] = "weak_momentum"
+            if signal == "short" and (momentum is None or momentum >= 0):
+                protection["reject_reason"] = "weak_momentum"
+        if signal and not protection["side_quality"]["passes"]:
+            protection["reject_reason"] = "side_quality_block"
+        consensus["profit_protection"] = protection
+        return protection["reject_reason"]
 
     def pending_key(self, config):
         return self.debug_key(config)
@@ -1375,6 +1477,8 @@ class OrderBookRecoveryService(Response):
             "average_momentum": consensus.get("average_momentum"),
             "consensus_direction": consensus.get("consensus_direction") or "none",
             "entry_blocked_reason": consensus.get("reject_reason") or (self.last_evaluation_for(config) or {}).get("reject_reason"),
+            "entry_skip_reason": self.entry_skip_reason(consensus.get("reject_reason") or (self.last_evaluation_for(config) or {}).get("reject_reason")),
+            "profit_protection": consensus.get("profit_protection") or {},
             "entry_mode": config.entry_mode,
             "resolved_live_symbol": live_market.get("resolved_live_symbol"),
             "live_market_type": live_market.get("live_market_type"),
@@ -1735,6 +1839,7 @@ class OrderBookRecoveryService(Response):
             "current_margin": margin,
             "current_notional": notional,
             "feedback_state": consensus.get("feedback") or {},
+            "profit_protection": consensus.get("profit_protection") or {},
             "risk_decision": {
                 "approved": True,
                 "reason": None,
@@ -1876,6 +1981,9 @@ class OrderBookRecoveryService(Response):
             live_status=(live_result.get("status") if live_result else ("open_failed" if live_error else None)),
             live_error=live_error or tpsl_error or (live_result.get("warning") if live_result else None),
             live_raw_open_response_json=self.live_execution_service.raw_json(live_result.get("raw_response")) if live_result else None,
+            gross_pnl=0,
+            net_pnl=0,
+            total_fee=live_result.get("fee") if live_result else 0,
             exchange_tp_order_id=tpsl.get("tp_order_id"),
             exchange_sl_order_id=tpsl.get("sl_order_id"),
             exchange_tp_price=tpsl.get("tp_price"),
@@ -1959,8 +2067,12 @@ class OrderBookRecoveryService(Response):
             except Exception as error:
                 trade.tp_sl_error = str(error)
         trade.exit_price = exit_price
-        trade.pnl = pnl
-        trade.result = "win" if pnl > 0 else "loss"
+        entry_fee = float(trade.live_entry_fee or 0)
+        trade.gross_pnl = pnl
+        trade.total_fee = entry_fee
+        trade.net_pnl = pnl - entry_fee
+        trade.pnl = trade.net_pnl
+        trade.result = "win" if trade.net_pnl > 0 else "loss"
         trade.reason_close = reason
         trade.closed_at = current_time
         trade.live_exit_price = exit_price
@@ -1973,7 +2085,7 @@ class OrderBookRecoveryService(Response):
         self.apply_recovery_after_close(state, config, trade.result, current_time)
         db.session.commit()
         payload = self.trade_to_dict(trade)
-        logger.info("OrderBookRecovery exchange-side position closed: trade_id=%s reason=%s pnl=%s", trade.id, reason, pnl)
+        logger.info("OrderBookRecovery exchange-side position closed: trade_id=%s reason=%s pnl=%s", trade.id, reason, trade.pnl)
         self.publisher.publish("orderbook_recovery.position_closed", payload)
         return payload
 
@@ -1984,7 +2096,11 @@ class OrderBookRecoveryService(Response):
                 exit_price = live_result["average_fill_price"]
                 entry_price = trade.live_entry_price or trade.entry_price
                 gross_pnl = self.calculate_pnl(trade.side, entry_price, exit_price, trade.notional)
-                pnl = gross_pnl - float(trade.live_entry_fee or 0) - float(live_result.get("fee") or 0)
+                total_fee = float(trade.live_entry_fee or 0) + float(live_result.get("fee") or 0)
+                pnl = gross_pnl - total_fee
+                trade.gross_pnl = gross_pnl
+                trade.total_fee = total_fee
+                trade.net_pnl = pnl
                 trade.live_close_order_id = live_result.get("order_id")
                 trade.live_exit_price = exit_price
                 trade.live_exit_fee = live_result.get("fee")
@@ -2019,6 +2135,10 @@ class OrderBookRecoveryService(Response):
                 logger.warning("OrderBookRecovery live close failed: trade_id=%s error=%s", trade.id, error)
                 return None
         trade.exit_price = exit_price
+        if trade.execution_mode != "live":
+            trade.gross_pnl = pnl
+            trade.total_fee = 0
+            trade.net_pnl = pnl
         trade.pnl = pnl
         trade.result = "win" if pnl > 0 else "loss"
         trade.reason_close = reason
@@ -2312,6 +2432,12 @@ class OrderBookRecoveryService(Response):
             "live_order_type": config.live_order_type,
             "live_reduce_only_close": config.live_reduce_only_close,
             "live_open_failed_cooldown_seconds": config.live_open_failed_cooldown_seconds,
+            "live_fee_filter_enabled": config.live_fee_filter_enabled,
+            "live_fee_filter_taker_fee_percent": config.live_fee_filter_taker_fee_percent,
+            "momentum_confirmation_enabled": config.momentum_confirmation_enabled,
+            "side_quality_filter_enabled": config.side_quality_filter_enabled,
+            "side_quality_lookback_trades": config.side_quality_lookback_trades,
+            "side_quality_cooldown_seconds": config.side_quality_cooldown_seconds,
             "cooldown_after_max_recovery_seconds": config.cooldown_after_max_recovery_seconds,
             "feedback_enabled": config.feedback_enabled,
             "feedback_lookback_trades": config.feedback_lookback_trades,
@@ -2423,6 +2549,9 @@ class OrderBookRecoveryService(Response):
             "live_error": trade.live_error,
             "live_raw_open_response_json": trade.live_raw_open_response_json,
             "live_raw_close_response_json": trade.live_raw_close_response_json,
+            "gross_pnl": trade.gross_pnl,
+            "net_pnl": trade.net_pnl,
+            "total_fee": trade.total_fee,
             "exchange_tp_order_id": trade.exchange_tp_order_id,
             "exchange_sl_order_id": trade.exchange_sl_order_id,
             "exchange_tp_price": trade.exchange_tp_price,

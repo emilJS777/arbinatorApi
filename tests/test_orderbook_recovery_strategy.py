@@ -1816,6 +1816,12 @@ def test_live_config_fields_roundtrip_through_api(client):
         "live_max_daily_loss_usdt": 4,
         "live_max_total_loss_usdt": 8,
         "live_order_type": "market",
+        "live_fee_filter_enabled": True,
+        "live_fee_filter_taker_fee_percent": 0.2,
+        "momentum_confirmation_enabled": True,
+        "side_quality_filter_enabled": True,
+        "side_quality_lookback_trades": 4,
+        "side_quality_cooldown_seconds": 120,
     })
     payload = response.get_json()["obj"]
     refreshed = client.get("/api/orderbook-recovery/config").get_json()["obj"]
@@ -1825,9 +1831,112 @@ def test_live_config_fields_roundtrip_through_api(client):
     assert payload["live_enabled_confirmation"] is True
     assert payload["live_kill_switch"] is False
     assert payload["live_max_margin_usdt"] == 9
+    assert payload["live_fee_filter_enabled"] is True
+    assert payload["live_fee_filter_taker_fee_percent"] == 0.2
+    assert payload["momentum_confirmation_enabled"] is True
+    assert payload["side_quality_filter_enabled"] is True
+    assert payload["side_quality_lookback_trades"] == 4
+    assert payload["side_quality_cooldown_seconds"] == 120
     assert refreshed["execution_mode"] == "live"
     assert refreshed["live_enabled_confirmation"] is True
     assert refreshed["live_kill_switch"] is False
+
+
+def test_live_fee_filter_blocks_entry_before_order_submit(client):
+    mock_client = MockLiveClient()
+    service = OrderBookRecoveryService(live_execution_service=LiveExecutionService(client_factory=lambda exchange: mock_client))
+    config = make_config(service)
+    exchange = seed_live_exchange("Mexc")
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.exchange_id = exchange.id
+    config.execution_mode = "live"
+    config.live_enabled_confirmation = True
+    config.live_kill_switch = False
+    config.live_fee_filter_enabled = True
+    config.live_fee_filter_taker_fee_percent = 5
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+
+    result = service.evaluate(config)
+    diagnostics = service.signal_diagnostics_for(config)["last_100"][-1]
+
+    assert result is None
+    assert mock_client.orders == []
+    assert StrategyRunTrade.query.count() == 0
+    assert service.last_evaluation_for(config)["reject_reason"] == "fee_filter"
+    assert diagnostics["skip_reason"] == "fee_filter"
+
+
+def test_side_quality_filter_blocks_recent_net_negative_side(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.feedback_enabled = False
+    config.side_quality_filter_enabled = True
+    config.side_quality_lookback_trades = 3
+    config.side_quality_cooldown_seconds = 600
+    db.session.commit()
+    for _ in range(3):
+        closed_trade(config, pnl=-1, side="long")
+    setup_long_consensus(service, config)
+
+    result = service.evaluate(config)
+    diagnostics = service.signal_diagnostics_for(config)["last_100"][-1]
+
+    assert result is None
+    assert StrategyRunTrade.query.count() == 3
+    assert service.last_evaluation_for(config)["reject_reason"] == "side_quality_block"
+    assert diagnostics["skip_reason"] == "side_quality_block"
+
+
+def test_live_close_uses_net_pnl_after_fees(client):
+    class FeeCloseService:
+        def close_position(self, config, trade, current_price):
+            return {
+                "order_id": "close-1",
+                "average_fill_price": 110,
+                "fee": 0.02,
+                "raw_response": {"id": "close-1"},
+            }
+
+        def raw_json(self, value):
+            return json.dumps(value)
+
+        def is_position_already_closed_error(self, error):
+            return False
+
+    service = OrderBookRecoveryService(live_execution_service=FeeCloseService())
+    config = make_config(service)
+    state = service.get_or_create_state(config)
+    trade = StrategyRunTrade(
+        strategy_config_id=config.id,
+        exchange=config.exchange,
+        symbol=config.symbol,
+        side="long",
+        margin=5,
+        leverage=2,
+        notional=10,
+        amount=0.1,
+        entry_price=100,
+        live_entry_price=100,
+        live_entry_fee=0.01,
+        execution_mode="live",
+        live_status="open",
+        opened_at=datetime.utcnow() - timedelta(minutes=1),
+    )
+    db.session.add(trade)
+    db.session.commit()
+
+    closed = service.close_trade(trade, 110, 1, "take_profit", state, config, datetime.utcnow())
+
+    assert round(closed["gross_pnl"], 6) == 1
+    assert round(closed["total_fee"], 6) == 0.03
+    assert round(closed["net_pnl"], 6) == 0.97
+    assert round(closed["pnl"], 6) == 0.97
+    assert closed["result"] == "win"
 
 
 def test_live_open_order_uses_mocked_ccxt(client):
@@ -2283,6 +2392,7 @@ def test_mexc_tpsl_creation_success_stores_order_ids(client):
     config.live_kill_switch = False
     config.take_profit_percent_of_margin = 0.25
     config.stop_loss_percent_of_margin = 0.3
+    config.live_fee_filter_enabled = False
     config.feedback_enabled = False
     db.session.commit()
     for source_exchange in ["Mexc", "Binance", "Bybit"]:

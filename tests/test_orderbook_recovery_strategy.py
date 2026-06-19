@@ -12,7 +12,7 @@ from src import db
 from src.Arbitrage.OrderBookSnapshotStore import OrderBookSnapshotStore
 from src.Exchange.ExchangeModel import Exchange
 from src.OrderBookRecovery.LiveExecutionService import LiveExecutionService
-from src.OrderBookRecovery.OrderBookRecoveryModel import MLFeatureSnapshot, MLMarketSnapshot, StrategyRunTrade
+from src.OrderBookRecovery.OrderBookRecoveryModel import MLFeatureSnapshot, MLMarketPriceHistory, MLMarketSnapshot, MLMarketSnapshotExchangeLabel, StrategyRunTrade
 from src.OrderBookRecovery.OrderBookNormalizer import OrderBookNormalizer
 from src.OrderBookRecovery.OrderBookRecoveryService import OrderBookRecoveryService
 
@@ -2100,6 +2100,32 @@ def test_ml_market_snapshot_not_saved_when_disabled(client):
     service.evaluate(config)
 
     assert MLMarketSnapshot.query.count() == 0
+    assert MLMarketSnapshotExchangeLabel.query.count() == 0
+    assert MLMarketPriceHistory.query.count() == 0
+
+
+def add_ml_label_and_history(snapshot, exchange, symbol, reference_price, prices, start_time):
+    label = MLMarketSnapshotExchangeLabel(
+        snapshot_id=snapshot.id,
+        exchange=exchange,
+        symbol=symbol,
+        reference_price=reference_price,
+        label_status="pending",
+    )
+    db.session.add(label)
+    for index, price in enumerate(prices, start=1):
+        db.session.add(MLMarketPriceHistory(
+            timestamp=start_time + timedelta(seconds=index * 10),
+            exchange=exchange,
+            symbol=symbol,
+            mid_price=price,
+            bid=price - 0.01,
+            ask=price + 0.01,
+            spread=0.02,
+            snapshot_age_sec=0,
+        ))
+    db.session.commit()
+    return label
 
 
 def test_ml_market_labeling_calculates_future_return(client):
@@ -2111,23 +2137,28 @@ def test_ml_market_labeling_calculates_future_return(client):
     config.take_profit_percent_of_margin = 1
     config.live_fee_filter_taker_fee_percent = 0
     now = datetime.utcnow()
-    db.session.add(MLMarketSnapshot(
+    snapshot = MLMarketSnapshot(
         timestamp=now - timedelta(seconds=61),
         exchange="Mexc",
         symbol="TON/USDT",
         reference_price=100,
         label_status="pending",
-    ))
+    )
+    db.session.add(snapshot)
     db.session.commit()
-    add_snapshot("Mexc", bid=101, ask=101.02)
+    add_ml_label_and_history(snapshot, "Mexc", "TON/USDT", 100, [101.01, 101.5, 100.5], snapshot.timestamp)
 
     result = service.label_pending_market_snapshots(config, now)
-    snapshot = MLMarketSnapshot.query.first()
+    snapshot = db.session.get(MLMarketSnapshot, snapshot.id)
 
-    assert result["updated"] == 1
+    assert result["updated"] >= 1
     assert snapshot.label_status == "labeled"
     assert round(snapshot.future_price_10s, 2) == 101.01
     assert round(snapshot.future_return_10s, 4) == 0.0101
+    assert round(snapshot.max_price_30s, 2) == 101.5
+    assert round(snapshot.min_price_30s, 2) == 100.5
+    assert round(snapshot.mfe_long_30s, 4) == 0.015
+    assert round(snapshot.mae_short_30s, 4) == -0.015
 
 
 def test_ml_market_long_short_labels_calculated(client):
@@ -2139,22 +2170,25 @@ def test_ml_market_long_short_labels_calculated(client):
     config.take_profit_percent_of_margin = 1
     config.live_fee_filter_taker_fee_percent = 0
     now = datetime.utcnow()
-    db.session.add(MLMarketSnapshot(
+    first_snapshot = MLMarketSnapshot(
         timestamp=now - timedelta(seconds=61),
         exchange="Mexc",
         symbol="TON/USDT",
         reference_price=100,
         label_status="pending",
-    ))
-    db.session.add(MLMarketSnapshot(
+    )
+    second_snapshot = MLMarketSnapshot(
         timestamp=now - timedelta(seconds=61),
         exchange="Mexc",
         symbol="TON/USDT",
         reference_price=103,
         label_status="pending",
-    ))
+    )
+    db.session.add(first_snapshot)
+    db.session.add(second_snapshot)
     db.session.commit()
-    add_snapshot("Mexc", bid=101, ask=101.02)
+    add_ml_label_and_history(first_snapshot, "Mexc", "TON/USDT", 100, [101.01, 101.01, 101.01], first_snapshot.timestamp)
+    add_ml_label_and_history(second_snapshot, "Mexc", "TON/USDT", 103, [101.01, 101.01, 101.01], second_snapshot.timestamp)
 
     service.label_pending_market_snapshots(config, now)
     first, second = MLMarketSnapshot.query.order_by(MLMarketSnapshot.id.asc()).all()
@@ -2163,6 +2197,55 @@ def test_ml_market_long_short_labels_calculated(client):
     assert first.short_would_win_10s is False
     assert second.long_would_win_10s is False
     assert second.short_would_win_10s is True
+
+
+def test_ml_market_per_exchange_and_aggregated_labels_are_created(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.ml_mode = "shadow"
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+
+    service.evaluate(config)
+
+    snapshot = MLMarketSnapshot.query.first()
+    labels = MLMarketSnapshotExchangeLabel.query.filter_by(snapshot_id=snapshot.id).all()
+
+    assert snapshot is not None
+    assert MLMarketPriceHistory.query.count() >= 5
+    assert {label.exchange for label in labels} >= {"Mexc", "Binance", "Bybit", "__median__", "__average__"}
+
+
+def test_ml_market_aggregated_median_labels_calculated(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.ml_mode = "shadow"
+    config.take_profit_percent_of_margin = 1
+    config.live_fee_filter_taker_fee_percent = 0
+    now = datetime.utcnow()
+    snapshot = MLMarketSnapshot(
+        timestamp=now - timedelta(seconds=61),
+        exchange="Mexc",
+        symbol="TON/USDT",
+        reference_price=100,
+        label_status="pending",
+    )
+    db.session.add(snapshot)
+    db.session.commit()
+    add_ml_label_and_history(snapshot, "Mexc", "TON/USDT", 100, [101, 102, 101], snapshot.timestamp)
+    add_ml_label_and_history(snapshot, "__median__", "TON/USDT", 100, [100.5, 101.5, 101], snapshot.timestamp)
+
+    service.label_pending_market_snapshots(config, now)
+    snapshot = db.session.get(MLMarketSnapshot, snapshot.id)
+
+    assert round(snapshot.median_future_return_10s, 3) == 0.005
+    assert round(snapshot.median_mfe_long_30s, 3) == 0.015
+    assert round(snapshot.median_mae_short_30s, 3) == -0.015
 
 
 def test_ml_market_snapshot_export_returns_json(client):
@@ -2185,6 +2268,34 @@ def test_ml_market_snapshot_export_returns_json(client):
     assert response.status_code == 200
     assert payload[0]["symbol"] == "TON/USDT"
     assert "future_return_10s" in payload[0]
+    assert "mfe_long_10s" in payload[0]
+    assert "median_future_return_10s" in payload[0]
+    assert "exchange_labels" in payload[0]
+
+
+def test_ml_exchange_labels_export_returns_csv(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    snapshot = MLMarketSnapshot(
+        timestamp=datetime.utcnow(),
+        exchange="Mexc",
+        symbol="TON/USDT",
+        reference_price=100,
+        label_status="pending",
+    )
+    db.session.add(snapshot)
+    db.session.commit()
+    add_ml_label_and_history(snapshot, "Mexc", "TON/USDT", 100, [101], snapshot.timestamp)
+
+    response = client.get("/api/orderbook-recovery/ml/exchange-labels/export?format=csv")
+    payload = response.data.decode("utf-8")
+
+    assert response.status_code == 200
+    assert "snapshot_id" in payload
+    assert "mfe_long_10s" in payload
+    assert "Mexc" in payload
 
 
 def test_live_open_order_uses_mocked_ccxt(client):

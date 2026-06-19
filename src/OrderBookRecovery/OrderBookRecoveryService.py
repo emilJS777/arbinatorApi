@@ -18,7 +18,9 @@ from src.Arbitrage.OrderBookSnapshotStore import OrderBookSnapshotStore
 from src.Exchange.ExchangeModel import Exchange
 from src.OrderBookRecovery.OrderBookRecoveryModel import (
     MLFeatureSnapshot,
+    MLMarketPriceHistory,
     MLMarketSnapshot,
+    MLMarketSnapshotExchangeLabel,
     OrderBookPatternStrategyConfig,
     RecoveryState,
     StrategyRun,
@@ -1427,6 +1429,90 @@ class OrderBookRecoveryService(Response):
         ).count()
         return count < cap
 
+    def ml_price_history_rows(self, config, consensus, evaluated_at):
+        rows = []
+        valid_features = [
+            row for row in (consensus or {}).get("per_exchange_features", [])
+            if row.get("valid") and row.get("mid_price")
+        ]
+        for row in valid_features:
+            rows.append(MLMarketPriceHistory(
+                timestamp=evaluated_at,
+                exchange=row.get("exchange"),
+                symbol=row.get("symbol") or config.symbol,
+                mid_price=float(row["mid_price"]),
+                bid=row.get("bid"),
+                ask=row.get("ask"),
+                spread=row.get("spread_percent"),
+                snapshot_age_sec=row.get("snapshot_age_seconds"),
+                created_at=datetime.utcnow(),
+            ))
+        mids = [float(row["mid_price"]) for row in valid_features]
+        if mids:
+            rows.append(MLMarketPriceHistory(
+                timestamp=evaluated_at,
+                exchange="__median__",
+                symbol=config.symbol,
+                mid_price=float(self.median(mids)),
+                bid=None,
+                ask=None,
+                spread=None,
+                snapshot_age_sec=None,
+                created_at=datetime.utcnow(),
+            ))
+            rows.append(MLMarketPriceHistory(
+                timestamp=evaluated_at,
+                exchange="__average__",
+                symbol=config.symbol,
+                mid_price=sum(mids) / len(mids),
+                bid=None,
+                ask=None,
+                spread=None,
+                snapshot_age_sec=None,
+                created_at=datetime.utcnow(),
+            ))
+        return rows
+
+    def create_ml_exchange_labels(self, config, market_snapshot, consensus):
+        valid_features = [
+            row for row in (consensus or {}).get("per_exchange_features", [])
+            if row.get("valid") and row.get("mid_price")
+        ]
+        labels = []
+        seen = set()
+        for row in valid_features:
+            key = (row.get("exchange"), row.get("symbol") or config.symbol)
+            if key in seen:
+                continue
+            seen.add(key)
+            labels.append(MLMarketSnapshotExchangeLabel(
+                snapshot_id=market_snapshot.id,
+                exchange=row.get("exchange"),
+                symbol=row.get("symbol") or config.symbol,
+                reference_price=float(row["mid_price"]),
+                label_status="pending",
+                created_at=datetime.utcnow(),
+            ))
+        mids = [float(row["mid_price"]) for row in valid_features]
+        if mids:
+            labels.append(MLMarketSnapshotExchangeLabel(
+                snapshot_id=market_snapshot.id,
+                exchange="__median__",
+                symbol=config.symbol,
+                reference_price=float(self.median(mids)),
+                label_status="pending",
+                created_at=datetime.utcnow(),
+            ))
+            labels.append(MLMarketSnapshotExchangeLabel(
+                snapshot_id=market_snapshot.id,
+                exchange="__average__",
+                symbol=config.symbol,
+                reference_price=sum(mids) / len(mids),
+                label_status="pending",
+                created_at=datetime.utcnow(),
+            ))
+        return labels
+
     def create_ml_market_snapshot(
         self,
         config,
@@ -1442,7 +1528,13 @@ class OrderBookRecoveryService(Response):
         features = features or {}
         consensus = consensus or {}
         reference_price = features.get("mid_price")
-        if reference_price is None or not self.should_capture_ml_market_snapshot(config, evaluated_at):
+        if reference_price is None or not self.ml_market_capture_enabled(config):
+            return None
+        history_rows = self.ml_price_history_rows(config, consensus, evaluated_at)
+        if history_rows:
+            db.session.add_all(history_rows)
+        if not self.should_capture_ml_market_snapshot(config, evaluated_at):
+            db.session.commit()
             return None
         snapshot = self.latest_snapshot_for(config) or {}
         source_time = snapshot.get("updated_at")
@@ -1471,51 +1563,130 @@ class OrderBookRecoveryService(Response):
             label_status="pending",
         )
         db.session.add(market_snapshot)
+        db.session.flush()
+        labels = self.create_ml_exchange_labels(config, market_snapshot, consensus)
+        if labels:
+            db.session.add_all(labels)
         db.session.commit()
         return market_snapshot
 
     def label_pending_market_snapshots(self, config=None, current_time=None):
         config = config or self.get_or_create_config()
         current_time = current_time or datetime.utcnow()
-        snapshot = self.snapshot_for(config.exchange, config.symbol)
-        if not snapshot:
-            return {"updated": 0, "reason": "no_valid_order_book_snapshot"}
-        current_price, error = self.snapshot_mid_price(snapshot)
-        if current_price is None:
-            return {"updated": 0, "reason": error}
-        current_price = float(current_price)
         required_return = self.ml_required_future_return(config)
         horizons = self.ml_label_horizons(config)
-        pending = (
+        pending_labels = (
+            MLMarketSnapshotExchangeLabel.query.filter_by(label_status="pending")
+            .join(MLMarketSnapshot, MLMarketSnapshot.id == MLMarketSnapshotExchangeLabel.snapshot_id)
+            .filter(MLMarketSnapshot.symbol == config.symbol)
+            .order_by(MLMarketSnapshot.timestamp.asc())
+            .limit(3000)
+            .all()
+        )
+        labels_updated = 0
+        for label in pending_labels:
+            if self.label_exchange_label(label, horizons, current_time):
+                labels_updated += 1
+        pending_snapshots = (
             MLMarketSnapshot.query.filter_by(exchange=config.exchange, symbol=config.symbol, label_status="pending")
             .order_by(MLMarketSnapshot.timestamp.asc())
             .limit(1000)
             .all()
         )
-        updated = 0
-        for item in pending:
-            age = (current_time - item.timestamp).total_seconds()
-            touched = False
-            for horizon in horizons:
-                price_attr = f"future_price_{horizon}s"
-                return_attr = f"future_return_{horizon}s"
-                long_attr = f"long_would_win_{horizon}s"
-                short_attr = f"short_would_win_{horizon}s"
-                if age >= horizon and getattr(item, price_attr) is None and item.reference_price:
-                    future_return = (current_price - float(item.reference_price)) / float(item.reference_price)
-                    setattr(item, price_attr, current_price)
-                    setattr(item, return_attr, future_return)
-                    setattr(item, long_attr, future_return >= required_return)
-                    setattr(item, short_attr, future_return <= -required_return)
-                    touched = True
-            if all(getattr(item, f"future_price_{horizon}s") is not None for horizon in horizons):
-                item.label_status = "labeled"
-                touched = True
-            if touched:
-                updated += 1
+        snapshots_updated = 0
+        for item in pending_snapshots:
+            if self.sync_market_snapshot_labels(item, horizons, required_return):
+                snapshots_updated += 1
+        updated = labels_updated + snapshots_updated
         if updated:
             db.session.commit()
-        return {"updated": updated, "required_return": required_return, "current_price": current_price}
+        return {"updated": updated, "required_return": required_return}
+
+    def label_values_from_history(self, reference_price, history):
+        if not reference_price or not history:
+            return None
+        prices = [float(row.mid_price) for row in history]
+        future_price = prices[-1]
+        max_price = max(prices)
+        min_price = min(prices)
+        reference = float(reference_price)
+        return {
+            "future_price": future_price,
+            "future_return": (future_price - reference) / reference,
+            "max_price": max_price,
+            "min_price": min_price,
+            "mfe_long": (max_price - reference) / reference,
+            "mae_long": (min_price - reference) / reference,
+            "mfe_short": (reference - min_price) / reference,
+            "mae_short": (reference - max_price) / reference,
+        }
+
+    def label_exchange_label(self, label, horizons, current_time):
+        touched = False
+        snapshot_time = label.snapshot.timestamp
+        for horizon in horizons:
+            if (current_time - snapshot_time).total_seconds() < horizon:
+                continue
+            if getattr(label, f"future_price_{horizon}s") is not None:
+                continue
+            end_time = snapshot_time + timedelta(seconds=horizon)
+            history = (
+                MLMarketPriceHistory.query.filter(
+                    MLMarketPriceHistory.exchange == label.exchange,
+                    MLMarketPriceHistory.symbol == label.symbol,
+                    MLMarketPriceHistory.timestamp > snapshot_time,
+                    MLMarketPriceHistory.timestamp <= end_time,
+                )
+                .order_by(MLMarketPriceHistory.timestamp.asc())
+                .all()
+            )
+            values = self.label_values_from_history(label.reference_price, history)
+            if not values:
+                continue
+            setattr(label, f"future_price_{horizon}s", values["future_price"])
+            setattr(label, f"future_return_{horizon}s", values["future_return"])
+            setattr(label, f"max_price_{horizon}s", values["max_price"])
+            setattr(label, f"min_price_{horizon}s", values["min_price"])
+            setattr(label, f"mfe_long_{horizon}s", values["mfe_long"])
+            setattr(label, f"mae_long_{horizon}s", values["mae_long"])
+            setattr(label, f"mfe_short_{horizon}s", values["mfe_short"])
+            setattr(label, f"mae_short_{horizon}s", values["mae_short"])
+            touched = True
+        if all(getattr(label, f"future_price_{horizon}s") is not None for horizon in horizons):
+            label.label_status = "labeled"
+            touched = True
+        return touched
+
+    def sync_market_snapshot_labels(self, snapshot, horizons, required_return):
+        labels = MLMarketSnapshotExchangeLabel.query.filter_by(snapshot_id=snapshot.id).all()
+        configured = next((label for label in labels if self.normalize_exchange(label.exchange) == self.normalize_exchange(snapshot.exchange)), None)
+        median_label = next((label for label in labels if label.exchange == "__median__"), None)
+        average_label = next((label for label in labels if label.exchange == "__average__"), None)
+        touched = False
+        for horizon in horizons:
+            if configured and getattr(configured, f"future_price_{horizon}s") is not None and getattr(snapshot, f"future_price_{horizon}s") is None:
+                future_return = getattr(configured, f"future_return_{horizon}s")
+                setattr(snapshot, f"future_price_{horizon}s", getattr(configured, f"future_price_{horizon}s"))
+                setattr(snapshot, f"future_return_{horizon}s", future_return)
+                setattr(snapshot, f"long_would_win_{horizon}s", future_return >= required_return)
+                setattr(snapshot, f"short_would_win_{horizon}s", future_return <= -required_return)
+                for field in ["max_price", "min_price", "mfe_long", "mae_long", "mfe_short", "mae_short"]:
+                    setattr(snapshot, f"{field}_{horizon}s", getattr(configured, f"{field}_{horizon}s"))
+                touched = True
+            if median_label and getattr(median_label, f"future_price_{horizon}s") is not None:
+                setattr(snapshot, f"median_future_price_{horizon}s", getattr(median_label, f"future_price_{horizon}s"))
+                setattr(snapshot, f"median_future_return_{horizon}s", getattr(median_label, f"future_return_{horizon}s"))
+                for field in ["mfe_long", "mae_long", "mfe_short", "mae_short"]:
+                    setattr(snapshot, f"median_{field}_{horizon}s", getattr(median_label, f"{field}_{horizon}s"))
+                touched = True
+            if average_label and getattr(average_label, f"future_price_{horizon}s") is not None:
+                setattr(snapshot, f"avg_future_price_{horizon}s", getattr(average_label, f"future_price_{horizon}s"))
+                setattr(snapshot, f"avg_future_return_{horizon}s", getattr(average_label, f"future_return_{horizon}s"))
+                touched = True
+        if all(getattr(snapshot, f"future_price_{horizon}s") is not None for horizon in horizons):
+            snapshot.label_status = "labeled"
+            touched = True
+        return touched
 
     def update_ml_snapshots_for_trade(self, trade):
         snapshots = MLFeatureSnapshot.query.filter_by(trade_id=trade.id).all()
@@ -1595,7 +1766,7 @@ class OrderBookRecoveryService(Response):
         return self.ml_snapshot_to_dict(snapshot) if snapshot else None
 
     def ml_market_snapshot_to_dict(self, snapshot):
-        return {
+        payload = {
             "id": snapshot.id,
             "timestamp": snapshot.timestamp,
             "symbol": snapshot.symbol,
@@ -1618,39 +1789,92 @@ class OrderBookRecoveryService(Response):
             "final_side": snapshot.final_side,
             "reject_reason": snapshot.reject_reason,
             "created_at": snapshot.created_at,
-            "future_price_10s": snapshot.future_price_10s,
-            "future_return_10s": snapshot.future_return_10s,
-            "long_would_win_10s": snapshot.long_would_win_10s,
-            "short_would_win_10s": snapshot.short_would_win_10s,
-            "future_price_30s": snapshot.future_price_30s,
-            "future_return_30s": snapshot.future_return_30s,
-            "long_would_win_30s": snapshot.long_would_win_30s,
-            "short_would_win_30s": snapshot.short_would_win_30s,
-            "future_price_60s": snapshot.future_price_60s,
-            "future_return_60s": snapshot.future_return_60s,
-            "long_would_win_60s": snapshot.long_would_win_60s,
-            "short_would_win_60s": snapshot.short_would_win_60s,
             "label_status": snapshot.label_status,
         }
+        for horizon in [10, 30, 60]:
+            for field in [
+                "future_price", "future_return", "long_would_win", "short_would_win",
+                "max_price", "min_price", "mfe_long", "mae_long", "mfe_short", "mae_short",
+                "median_future_price", "median_future_return", "avg_future_price", "avg_future_return",
+                "median_mfe_long", "median_mae_long", "median_mfe_short", "median_mae_short",
+            ]:
+                key = f"{field}_{horizon}s"
+                payload[key] = getattr(snapshot, key, None)
+        payload["exchange_labels"] = [
+            self.ml_exchange_label_to_dict(label)
+            for label in MLMarketSnapshotExchangeLabel.query.filter_by(snapshot_id=snapshot.id).order_by(MLMarketSnapshotExchangeLabel.exchange.asc()).all()
+        ]
+        return payload
+
+    def ml_exchange_label_to_dict(self, label):
+        payload = {
+            "id": label.id,
+            "snapshot_id": label.snapshot_id,
+            "exchange": label.exchange,
+            "symbol": label.symbol,
+            "reference_price": label.reference_price,
+            "label_status": label.label_status,
+            "created_at": label.created_at,
+        }
+        for horizon in [10, 30, 60]:
+            for field in [
+                "future_price", "future_return", "max_price", "min_price",
+                "mfe_long", "mae_long", "mfe_short", "mae_short",
+            ]:
+                key = f"{field}_{horizon}s"
+                payload[key] = getattr(label, key, None)
+        return payload
+
+    def ml_exchange_label_fields(self):
+        fields = ["id", "snapshot_id", "exchange", "symbol", "reference_price", "label_status", "created_at"]
+        for horizon in [10, 30, 60]:
+            fields.extend([
+                f"future_price_{horizon}s", f"future_return_{horizon}s",
+                f"max_price_{horizon}s", f"min_price_{horizon}s",
+                f"mfe_long_{horizon}s", f"mae_long_{horizon}s",
+                f"mfe_short_{horizon}s", f"mae_short_{horizon}s",
+            ])
+        return fields
 
     def ml_market_dataset_fields(self):
-        return [
+        fields = [
             "id", "timestamp", "symbol", "exchange", "reference_price", "median_imbalance", "raw_avg_imbalance",
             "spread", "momentum", "valid_exchanges_count", "long_confirms", "short_confirms", "long_ratio",
             "short_ratio", "anomaly_count", "snapshot_age_sec", "configured_exchange_long_signal",
             "configured_exchange_short_signal", "proposed_side", "final_side", "reject_reason", "created_at",
-            "future_price_10s", "future_return_10s", "long_would_win_10s", "short_would_win_10s",
-            "future_price_30s", "future_return_30s", "long_would_win_30s", "short_would_win_30s",
-            "future_price_60s", "future_return_60s", "long_would_win_60s", "short_would_win_60s",
-            "label_status",
         ]
+        for horizon in [10, 30, 60]:
+            fields.extend([
+                f"future_price_{horizon}s", f"future_return_{horizon}s",
+                f"long_would_win_{horizon}s", f"short_would_win_{horizon}s",
+                f"max_price_{horizon}s", f"min_price_{horizon}s",
+                f"mfe_long_{horizon}s", f"mae_long_{horizon}s",
+                f"mfe_short_{horizon}s", f"mae_short_{horizon}s",
+                f"median_future_price_{horizon}s", f"median_future_return_{horizon}s",
+                f"avg_future_price_{horizon}s", f"avg_future_return_{horizon}s",
+                f"median_mfe_long_{horizon}s", f"median_mae_long_{horizon}s",
+                f"median_mfe_short_{horizon}s", f"median_mae_short_{horizon}s",
+            ])
+        fields.extend(["label_status", "exchange_labels"])
+        return fields
 
     def ml_market_snapshot_stats(self, config):
         query = MLMarketSnapshot.query.filter_by(exchange=config.exchange, symbol=config.symbol)
+        label_query = MLMarketSnapshotExchangeLabel.query.join(MLMarketSnapshot, MLMarketSnapshot.id == MLMarketSnapshotExchangeLabel.snapshot_id).filter(
+            MLMarketSnapshot.exchange == config.exchange,
+            MLMarketSnapshot.symbol == config.symbol,
+        )
+        label_total = label_query.count()
+        label_pending = label_query.filter(MLMarketSnapshotExchangeLabel.label_status == "pending").count()
+        label_labeled = label_query.filter(MLMarketSnapshotExchangeLabel.label_status == "labeled").count()
         return {
             "total": query.count(),
             "pending": query.filter_by(label_status="pending").count(),
             "labeled": query.filter_by(label_status="labeled").count(),
+            "exchange_labels_total": label_total,
+            "exchange_labels_pending": label_pending,
+            "exchange_labels_labeled": label_labeled,
+            "exchange_label_completion_percent": (label_labeled / label_total * 100) if label_total else 0,
         }
 
     def export_ml_market_snapshots(self, export_format="csv"):
@@ -1666,9 +1890,28 @@ class OrderBookRecoveryService(Response):
         output = StringIO()
         writer = csv.DictWriter(output, fieldnames=self.ml_market_dataset_fields())
         writer.writeheader()
+        for row in rows:
+            row["exchange_labels"] = json.dumps(row.get("exchange_labels") or [], default=str, ensure_ascii=False)
         writer.writerows(rows)
         buffer = BytesIO(output.getvalue().encode("utf-8"))
         return send_file(buffer, mimetype="text/csv", as_attachment=True, download_name=f"orderbook-recovery-ml-market-snapshots-{stamp}.csv")
+
+    def export_ml_exchange_labels(self, export_format="csv"):
+        config = self.get_or_create_config()
+        self.label_pending_market_snapshots(config)
+        labels = MLMarketSnapshotExchangeLabel.query.order_by(MLMarketSnapshotExchangeLabel.id.asc()).all()
+        rows = [self.ml_exchange_label_to_dict(label) for label in labels]
+        stamp = datetime.utcnow().strftime("%Y-%m-%d-%H-%M")
+        if export_format == "json":
+            payload = json.dumps(rows, default=str, ensure_ascii=False, indent=2)
+            buffer = BytesIO(payload.encode("utf-8"))
+            return send_file(buffer, mimetype="application/json", as_attachment=True, download_name=f"orderbook-recovery-ml-exchange-labels-{stamp}.json")
+        output = StringIO()
+        writer = csv.DictWriter(output, fieldnames=self.ml_exchange_label_fields())
+        writer.writeheader()
+        writer.writerows(rows)
+        buffer = BytesIO(output.getvalue().encode("utf-8"))
+        return send_file(buffer, mimetype="text/csv", as_attachment=True, download_name=f"orderbook-recovery-ml-exchange-labels-{stamp}.csv")
 
     def pending_key(self, config):
         return self.debug_key(config)
@@ -1949,6 +2192,10 @@ class OrderBookRecoveryService(Response):
             "ml_market_snapshots_count": ml_market_stats["total"],
             "ml_market_snapshots_pending_count": ml_market_stats["pending"],
             "ml_market_snapshots_labeled_count": ml_market_stats["labeled"],
+            "ml_exchange_labels_count": ml_market_stats["exchange_labels_total"],
+            "ml_exchange_labels_pending_count": ml_market_stats["exchange_labels_pending"],
+            "ml_exchange_labels_labeled_count": ml_market_stats["exchange_labels_labeled"],
+            "ml_exchange_label_completion_percent": ml_market_stats["exchange_label_completion_percent"],
             "entry_mode": config.entry_mode,
             "resolved_live_symbol": live_market.get("resolved_live_symbol"),
             "live_market_type": live_market.get("live_market_type"),
@@ -2030,6 +2277,8 @@ class OrderBookRecoveryService(Response):
         return {
             "bid_volume_top_5": bid_volume,
             "ask_volume_top_5": ask_volume,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
             "imbalance": bid_volume / ask_volume,
             "spread_percent": spread_percent,
             "mid_price": mid_price,
@@ -2090,6 +2339,9 @@ class OrderBookRecoveryService(Response):
             "is_imbalance_anomaly": bool(is_anomaly),
             "spread_percent": features["spread_percent"],
             "momentum": features["short_momentum"],
+            "bid": features["best_bid"],
+            "ask": features["best_ask"],
+            "mid_price": features["mid_price"],
             "long_signal": raw_imbalance > config.long_imbalance_threshold,
             "short_signal": raw_imbalance <= config.short_imbalance_threshold,
         })

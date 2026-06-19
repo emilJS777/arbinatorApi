@@ -12,7 +12,7 @@ from src import db
 from src.Arbitrage.OrderBookSnapshotStore import OrderBookSnapshotStore
 from src.Exchange.ExchangeModel import Exchange
 from src.OrderBookRecovery.LiveExecutionService import LiveExecutionService
-from src.OrderBookRecovery.OrderBookRecoveryModel import StrategyRunTrade
+from src.OrderBookRecovery.OrderBookRecoveryModel import MLFeatureSnapshot, StrategyRunTrade
 from src.OrderBookRecovery.OrderBookNormalizer import OrderBookNormalizer
 from src.OrderBookRecovery.OrderBookRecoveryService import OrderBookRecoveryService
 
@@ -1937,6 +1937,93 @@ def test_live_close_uses_net_pnl_after_fees(client):
     assert round(closed["net_pnl"], 6) == 0.97
     assert round(closed["pnl"], 6) == 0.97
     assert closed["result"] == "win"
+
+
+def test_ml_disabled_mode_does_not_store_feature_snapshots(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.ml_mode = "disabled"
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+
+    result = service.evaluate(config)
+
+    assert result["side"] == "long"
+    assert MLFeatureSnapshot.query.count() == 0
+
+
+def test_ml_shadow_mode_stores_feature_snapshot(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.ml_mode = "shadow"
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+
+    result = service.evaluate(config)
+    snapshots = MLFeatureSnapshot.query.order_by(MLFeatureSnapshot.id.asc()).all()
+
+    assert result["side"] == "long"
+    assert len(snapshots) >= 1
+    assert snapshots[0].symbol == "TON/USDT"
+    assert snapshots[0].exchange == "Mexc"
+    assert snapshots[0].proposed_side == "long"
+    assert snapshots[0].final_side == "long"
+    assert snapshots[0].ml_score is None
+    assert snapshots[0].ml_reason == "model_file_not_found"
+
+
+def test_ml_shadow_mode_does_not_affect_trading_decision(client):
+    class BearishShadowModel:
+        def predict(self, features):
+            return {
+                "ml_score": 0.01,
+                "ml_decision": "reject",
+                "ml_reason": "shadow_prediction_only",
+                "ml_model_version": "test-model",
+            }
+
+    service = OrderBookRecoveryService(ml_prediction_service=BearishShadowModel())
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.ml_mode = "shadow"
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+
+    result = service.evaluate(config)
+    diagnostics = service.signal_diagnostics_for(config)["last_100"][-1]
+
+    assert result["side"] == "long"
+    assert diagnostics["ml_score"] == 0.01
+    assert diagnostics["ml_decision"] == "reject"
+    assert StrategyRunTrade.query.count() == 1
+
+
+def test_ml_dataset_export_returns_json(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.ml_mode = "shadow"
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+    service.evaluate(config)
+
+    response = client.get("/api/orderbook-recovery/ml/dataset/export?format=json")
+    payload = json.loads(response.data.decode("utf-8"))
+
+    assert response.status_code == 200
+    assert payload
+    assert payload[0]["symbol"] == "TON/USDT"
+    assert "ml_score" in payload[0]
 
 
 def test_live_open_order_uses_mocked_ccxt(client):

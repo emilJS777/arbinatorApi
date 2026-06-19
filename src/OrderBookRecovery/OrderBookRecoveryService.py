@@ -6,6 +6,7 @@ import csv
 import json
 import logging
 import time
+from uuid import uuid4
 
 from flask import jsonify, make_response, send_file
 from sqlalchemy import or_
@@ -14,6 +15,7 @@ from src import db
 from src.Arbitrage.OrderBookSnapshotStore import OrderBookSnapshotStore
 from src.Exchange.ExchangeModel import Exchange
 from src.OrderBookRecovery.OrderBookRecoveryModel import (
+    MLFeatureSnapshot,
     OrderBookPatternStrategyConfig,
     RecoveryState,
     StrategyRun,
@@ -21,6 +23,7 @@ from src.OrderBookRecovery.OrderBookRecoveryModel import (
 )
 from src.OrderBookRecovery.OrderBookNormalizer import OrderBookNormalizer
 from src.OrderBookRecovery.LiveExecutionService import LiveExecutionService, LiveExecutionError
+from src.OrderBookRecovery.MLPredictionService import MLPredictionService
 from src.OrderBookRecovery.SignalFeedbackService import SignalFeedbackService
 from src.TradingPair.TradingPairModel import TradingPair
 from src.Socket.EventPublisher import EventPublisher
@@ -57,10 +60,11 @@ class OrderBookRecoveryService(Response):
         "final_short_count": 0,
     })
 
-    def __init__(self, publisher=None, live_execution_service=None):
+    def __init__(self, publisher=None, live_execution_service=None, ml_prediction_service=None):
         self.publisher = publisher or EventPublisher()
         self.feedback_service = SignalFeedbackService()
         self.live_execution_service = live_execution_service or LiveExecutionService()
+        self.ml_prediction_service = ml_prediction_service or MLPredictionService()
 
     def get_or_create_config(self):
         config = OrderBookPatternStrategyConfig.query.order_by(OrderBookPatternStrategyConfig.id.asc()).first()
@@ -188,6 +192,7 @@ class OrderBookRecoveryService(Response):
             "side_quality_filter_enabled",
             "side_quality_lookback_trades",
             "side_quality_cooldown_seconds",
+            "ml_mode",
             "cooldown_after_max_recovery_seconds",
             "feedback_enabled",
             "feedback_lookback_trades",
@@ -211,6 +216,8 @@ class OrderBookRecoveryService(Response):
         config.live_fee_filter_taker_fee_percent = max(0, float(config.live_fee_filter_taker_fee_percent or 0))
         config.side_quality_lookback_trades = max(1, int(config.side_quality_lookback_trades or 5))
         config.side_quality_cooldown_seconds = max(0, int(config.side_quality_cooldown_seconds or 0))
+        if config.ml_mode not in {"disabled", "shadow"}:
+            config.ml_mode = "disabled"
         config.signal_diagnostics_max_rows = min(500, max(20, int(config.signal_diagnostics_max_rows or 100)))
         config.paper_mode_only = True
 
@@ -706,6 +713,8 @@ class OrderBookRecoveryService(Response):
         }
 
     def decision_details_payload(self, trade):
+        ml_snapshots = MLFeatureSnapshot.query.filter_by(trade_id=trade.id).order_by(MLFeatureSnapshot.timestamp.desc()).all()
+        latest_ml = self.ml_snapshot_to_dict(ml_snapshots[0]) if ml_snapshots else None
         return {
             "trade": self.trade_to_dict(trade),
             "summary": {
@@ -747,6 +756,8 @@ class OrderBookRecoveryService(Response):
             "consensus": (self.parse_json(trade.decision_snapshot_json) or {}).get("consensus_decision") or {},
             "feedback": (self.parse_json(trade.decision_snapshot_json) or {}).get("feedback_state") or {},
             "risk": (self.parse_json(trade.decision_snapshot_json) or {}).get("risk_decision") or {},
+            "ml": latest_ml or (self.parse_json(trade.decision_snapshot_json) or {}).get("ml_prediction") or {},
+            "ml_snapshots": [self.ml_snapshot_to_dict(snapshot) for snapshot in ml_snapshots],
         }
 
     def parse_json(self, value):
@@ -1032,6 +1043,11 @@ class OrderBookRecoveryService(Response):
         key = self.debug_key(config)
         proposed_side = proposed_side or self.diagnostic_side(long_signal, short_signal, consensus)
         final_side = final_side or "none"
+        state = self.get_or_create_state(config)
+        ml_snapshot = self.create_ml_feature_snapshot(config, state, features, consensus, proposed_side, final_side, evaluated_at)
+        ml_prediction = consensus.get("ml_prediction") or (
+            self.ml_snapshot_to_dict(ml_snapshot) if ml_snapshot else {}
+        )
         audit = self.side_decision_audit(config, features, consensus, feedback, final_side)
         row = {
             "timestamp": evaluated_at or datetime.utcnow(),
@@ -1055,6 +1071,10 @@ class OrderBookRecoveryService(Response):
             "consensus_direction": consensus.get("consensus_direction"),
             "feedback_reject_reason": feedback.get("feedback_reject_reason"),
             "profit_protection": consensus.get("profit_protection") or {},
+            "ml_score": ml_prediction.get("ml_score"),
+            "ml_decision": ml_prediction.get("ml_decision"),
+            "ml_reason": ml_prediction.get("ml_reason"),
+            "ml_model_version": ml_prediction.get("ml_model_version"),
             **audit,
         }
         self.__class__._signal_diagnostics[key].append(row)
@@ -1211,6 +1231,139 @@ class OrderBookRecoveryService(Response):
             protection["reject_reason"] = "side_quality_block"
         consensus["profit_protection"] = protection
         return protection["reject_reason"]
+
+    def ml_enabled(self, config):
+        return getattr(config, "ml_mode", "disabled") == "shadow"
+
+    def ml_feature_payload(self, config, state, features=None, consensus=None, proposed_side=None, final_side=None, evaluated_at=None, trade=None):
+        features = features or {}
+        consensus = consensus or {}
+        snapshot = self.latest_snapshot_for(config) or {}
+        return {
+            "trade_id": trade.id if trade else None,
+            "evaluation_id": consensus.get("evaluation_id") or str(uuid4()),
+            "timestamp": evaluated_at or datetime.utcnow(),
+            "symbol": config.symbol,
+            "exchange": config.exchange,
+            "proposed_side": proposed_side,
+            "final_side": final_side,
+            "median_imbalance": consensus.get("median_imbalance"),
+            "raw_avg_imbalance": consensus.get("raw_average_imbalance"),
+            "spread": features.get("spread_percent") or consensus.get("configured_exchange_spread"),
+            "momentum": consensus.get("average_momentum", features.get("short_momentum")),
+            "valid_exchanges_count": consensus.get("valid_exchanges_count"),
+            "confirming_long_count": consensus.get("confirming_long_count"),
+            "confirming_short_count": consensus.get("confirming_short_count"),
+            "consensus_ratio_long": consensus.get("consensus_ratio_long"),
+            "consensus_ratio_short": consensus.get("consensus_ratio_short"),
+            "anomaly_count": consensus.get("anomalous_exchanges_count"),
+            "snapshot_age_sec": (snapshot.get("updated_at") and (datetime.utcnow() - snapshot["updated_at"]).total_seconds()),
+            "configured_exchange_long_signal": consensus.get("configured_exchange_long_signal"),
+            "configured_exchange_short_signal": consensus.get("configured_exchange_short_signal"),
+            "current_step": state.current_step if state else None,
+            "margin": (state.current_margin if state else None) or config.base_margin_usdt,
+            "leverage": config.leverage,
+            "tp_percent": config.take_profit_percent_of_margin,
+            "sl_percent": config.stop_loss_percent_of_margin,
+            "entry_mode": consensus.get("entry_mode") or config.entry_mode,
+            "result": trade.result if trade else None,
+            "gross_pnl": trade.gross_pnl if trade else None,
+            "net_pnl": trade.net_pnl if trade else None,
+            "total_fee": trade.total_fee if trade else None,
+        }
+
+    def create_ml_feature_snapshot(self, config, state, features=None, consensus=None, proposed_side=None, final_side=None, evaluated_at=None, trade=None):
+        if not self.ml_enabled(config):
+            return None
+        consensus = consensus or {}
+        if not consensus.get("evaluation_id"):
+            consensus["evaluation_id"] = str(uuid4())
+        payload = self.ml_feature_payload(config, state, features, consensus, proposed_side, final_side, evaluated_at, trade)
+        prediction = self.ml_prediction_service.predict(payload)
+        payload.update(prediction)
+        snapshot = MLFeatureSnapshot(**payload)
+        db.session.add(snapshot)
+        db.session.commit()
+        consensus["ml_prediction"] = prediction
+        consensus["ml_feature_snapshot_id"] = snapshot.id
+        return snapshot
+
+    def update_ml_snapshots_for_trade(self, trade):
+        snapshots = MLFeatureSnapshot.query.filter_by(trade_id=trade.id).all()
+        for snapshot in snapshots:
+            snapshot.result = trade.result
+            snapshot.gross_pnl = trade.gross_pnl
+            snapshot.net_pnl = trade.net_pnl
+            snapshot.total_fee = trade.total_fee
+        return snapshots
+
+    def ml_snapshot_to_dict(self, snapshot):
+        return {
+            "id": snapshot.id,
+            "trade_id": snapshot.trade_id,
+            "evaluation_id": snapshot.evaluation_id,
+            "timestamp": snapshot.timestamp,
+            "symbol": snapshot.symbol,
+            "exchange": snapshot.exchange,
+            "proposed_side": snapshot.proposed_side,
+            "final_side": snapshot.final_side,
+            "median_imbalance": snapshot.median_imbalance,
+            "raw_avg_imbalance": snapshot.raw_avg_imbalance,
+            "spread": snapshot.spread,
+            "momentum": snapshot.momentum,
+            "valid_exchanges_count": snapshot.valid_exchanges_count,
+            "confirming_long_count": snapshot.confirming_long_count,
+            "confirming_short_count": snapshot.confirming_short_count,
+            "consensus_ratio_long": snapshot.consensus_ratio_long,
+            "consensus_ratio_short": snapshot.consensus_ratio_short,
+            "anomaly_count": snapshot.anomaly_count,
+            "snapshot_age_sec": snapshot.snapshot_age_sec,
+            "configured_exchange_long_signal": snapshot.configured_exchange_long_signal,
+            "configured_exchange_short_signal": snapshot.configured_exchange_short_signal,
+            "current_step": snapshot.current_step,
+            "margin": snapshot.margin,
+            "leverage": snapshot.leverage,
+            "tp_percent": snapshot.tp_percent,
+            "sl_percent": snapshot.sl_percent,
+            "entry_mode": snapshot.entry_mode,
+            "result": snapshot.result,
+            "gross_pnl": snapshot.gross_pnl,
+            "net_pnl": snapshot.net_pnl,
+            "total_fee": snapshot.total_fee,
+            "ml_score": snapshot.ml_score,
+            "ml_decision": snapshot.ml_decision,
+            "ml_reason": snapshot.ml_reason,
+            "ml_model_version": snapshot.ml_model_version,
+        }
+
+    def ml_dataset_fields(self):
+        return [
+            "id", "trade_id", "evaluation_id", "timestamp", "symbol", "exchange", "proposed_side", "final_side",
+            "median_imbalance", "raw_avg_imbalance", "spread", "momentum", "valid_exchanges_count",
+            "confirming_long_count", "confirming_short_count", "consensus_ratio_long", "consensus_ratio_short",
+            "anomaly_count", "snapshot_age_sec", "configured_exchange_long_signal", "configured_exchange_short_signal",
+            "current_step", "margin", "leverage", "tp_percent", "sl_percent", "entry_mode", "result",
+            "gross_pnl", "net_pnl", "total_fee", "ml_score", "ml_decision", "ml_reason", "ml_model_version",
+        ]
+
+    def export_ml_dataset(self, export_format="csv"):
+        snapshots = MLFeatureSnapshot.query.order_by(MLFeatureSnapshot.timestamp.asc()).all()
+        rows = [self.ml_snapshot_to_dict(snapshot) for snapshot in snapshots]
+        stamp = datetime.utcnow().strftime("%Y-%m-%d-%H-%M")
+        if export_format == "json":
+            payload = json.dumps(rows, default=str, ensure_ascii=False, indent=2)
+            buffer = BytesIO(payload.encode("utf-8"))
+            return send_file(buffer, mimetype="application/json", as_attachment=True, download_name=f"orderbook-recovery-ml-dataset-{stamp}.json")
+        output = StringIO()
+        writer = csv.DictWriter(output, fieldnames=self.ml_dataset_fields())
+        writer.writeheader()
+        writer.writerows(rows)
+        buffer = BytesIO(output.getvalue().encode("utf-8"))
+        return send_file(buffer, mimetype="text/csv", as_attachment=True, download_name=f"orderbook-recovery-ml-dataset-{stamp}.csv")
+
+    def latest_ml_snapshot_for_config(self, config):
+        snapshot = MLFeatureSnapshot.query.filter_by(exchange=config.exchange, symbol=config.symbol).order_by(MLFeatureSnapshot.timestamp.desc()).first()
+        return self.ml_snapshot_to_dict(snapshot) if snapshot else None
 
     def pending_key(self, config):
         return self.debug_key(config)
@@ -1450,6 +1603,7 @@ class OrderBookRecoveryService(Response):
         confirmation = self.__class__._last_confirmation_results.get(self.pending_key(config)) or {}
         live_market = self.live_market_debug(config)
         signal_diagnostics = self.signal_diagnostics_for(config)
+        latest_ml_snapshot = self.latest_ml_snapshot_for_config(config)
         margin_limit = self.live_execution_service.margin_limit_debug(
             config,
             state.current_margin or config.base_margin_usdt,
@@ -1479,6 +1633,12 @@ class OrderBookRecoveryService(Response):
             "entry_blocked_reason": consensus.get("reject_reason") or (self.last_evaluation_for(config) or {}).get("reject_reason"),
             "entry_skip_reason": self.entry_skip_reason(consensus.get("reject_reason") or (self.last_evaluation_for(config) or {}).get("reject_reason")),
             "profit_protection": consensus.get("profit_protection") or {},
+            "ml_mode": config.ml_mode,
+            "ml_latest_snapshot": latest_ml_snapshot,
+            "ml_score": (latest_ml_snapshot or {}).get("ml_score"),
+            "ml_decision": (latest_ml_snapshot or {}).get("ml_decision"),
+            "ml_reason": (latest_ml_snapshot or {}).get("ml_reason"),
+            "ml_model_version": (latest_ml_snapshot or {}).get("ml_model_version"),
             "entry_mode": config.entry_mode,
             "resolved_live_symbol": live_market.get("resolved_live_symbol"),
             "live_market_type": live_market.get("live_market_type"),
@@ -1840,6 +2000,7 @@ class OrderBookRecoveryService(Response):
             "current_notional": notional,
             "feedback_state": consensus.get("feedback") or {},
             "profit_protection": consensus.get("profit_protection") or {},
+            "ml_prediction": consensus.get("ml_prediction") or {},
             "risk_decision": {
                 "approved": True,
                 "reason": None,
@@ -1995,6 +2156,7 @@ class OrderBookRecoveryService(Response):
         state.last_opened_at = current_time
         db.session.add(trade)
         db.session.commit()
+        self.create_ml_feature_snapshot(config, state, features, consensus, side, (None if live_error else side), current_time, trade)
         payload = self.trade_to_dict(trade)
         if live_error:
             logger.warning("OrderBookRecovery live open failed: trade_id=%s error=%s", trade.id, live_error)
@@ -2082,6 +2244,7 @@ class OrderBookRecoveryService(Response):
         trade.pnl_source = pnl_source
         trade.tp_sl_protected = False
         trade.holding_seconds = (trade.closed_at - trade.opened_at).total_seconds() if trade.opened_at else None
+        self.update_ml_snapshots_for_trade(trade)
         self.apply_recovery_after_close(state, config, trade.result, current_time)
         db.session.commit()
         payload = self.trade_to_dict(trade)
@@ -2144,6 +2307,7 @@ class OrderBookRecoveryService(Response):
         trade.reason_close = reason
         trade.closed_at = current_time
         trade.holding_seconds = (trade.closed_at - trade.opened_at).total_seconds() if trade.opened_at else None
+        self.update_ml_snapshots_for_trade(trade)
         self.apply_recovery_after_close(state, config, trade.result, current_time)
         db.session.commit()
         payload = self.trade_to_dict(trade)
@@ -2438,6 +2602,7 @@ class OrderBookRecoveryService(Response):
             "side_quality_filter_enabled": config.side_quality_filter_enabled,
             "side_quality_lookback_trades": config.side_quality_lookback_trades,
             "side_quality_cooldown_seconds": config.side_quality_cooldown_seconds,
+            "ml_mode": config.ml_mode,
             "cooldown_after_max_recovery_seconds": config.cooldown_after_max_recovery_seconds,
             "feedback_enabled": config.feedback_enabled,
             "feedback_lookback_trades": config.feedback_lookback_trades,

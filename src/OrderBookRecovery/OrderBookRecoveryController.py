@@ -161,3 +161,11 @@ class OrderBookRecoveryTradeExportController(Controller):
         include_archived = str(self.request.args.get("include_archived", "false")).lower() == "true"
         export_format = str(self.request.args.get("format", "csv")).lower()
         return self.service.export_trades(include_archived, export_format)
+
+
+class OrderBookRecoveryMLDatasetExportController(Controller):
+    service = OrderBookRecoveryService()
+
+    def get(self):
+        export_format = str(self.request.args.get("format", "csv")).lower()
+        return self.service.export_ml_dataset(export_format)

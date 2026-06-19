@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from decimal import Decimal
 import csv
 import io
 import json
@@ -2416,6 +2417,108 @@ def test_ml_stats_endpoint_returns_numeric_shape(client):
     assert payload["ml_exchange_labels_count"] == 0
     assert payload["ml_exchange_labels_pending_count"] == 0
     assert payload["ml_exchange_labels_labeled_count"] == 0
+
+
+def test_ml_dataset_empty_endpoints_return_stable_shapes(client):
+    endpoints = [
+        "/api/orderbook-recovery/ml/feature-snapshots",
+        "/api/orderbook-recovery/ml/market-snapshots",
+        "/api/orderbook-recovery/ml/price-history",
+        "/api/orderbook-recovery/ml/exchange-labels",
+    ]
+
+    for endpoint in endpoints:
+        response = client.get(endpoint)
+        payload = response.get_json()["obj"]
+
+        assert response.status_code == 200
+        assert payload["items"] == []
+        assert payload["page"] == 1
+        assert payload["page_size"] == 50
+        assert payload["total"] == 0
+        assert payload["total_pages"] == 0
+
+
+def test_ml_dataset_invalid_pagination_is_bounded(client):
+    response = client.get("/api/orderbook-recovery/ml/price-history?page=bad&page_size=99999")
+    payload = response.get_json()["obj"]
+
+    assert response.status_code == 200
+    assert payload["items"] == []
+    assert payload["page"] == 1
+    assert payload["page_size"] == 50
+
+    response = client.get("/api/orderbook-recovery/ml/price-history?page=1&page_size=99999")
+    payload = response.get_json()["obj"]
+
+    assert response.status_code == 200
+    assert payload["page_size"] == 200
+
+
+def test_ml_dataset_detail_missing_returns_404(client):
+    response = client.get("/api/orderbook-recovery/ml/feature-snapshots/999999")
+
+    assert response.status_code == 404
+
+
+def test_ml_dataset_detail_serializes_datetime_and_nullable_fields(client):
+    snapshot_time = datetime.utcnow().replace(microsecond=0)
+    snapshot = MLFeatureSnapshot(
+        evaluation_id="eval-safe-serialization",
+        timestamp=snapshot_time,
+        symbol="TON/USDT",
+        exchange="Mexc",
+        proposed_side=None,
+        final_side=None,
+        ml_reason=None,
+    )
+    db.session.add(snapshot)
+    db.session.commit()
+
+    response = client.get(f"/api/orderbook-recovery/ml/feature-snapshots/{snapshot.id}")
+    payload = response.get_json()["obj"]
+
+    assert response.status_code == 200
+    assert payload["timestamp"] == snapshot_time.isoformat()
+    assert payload["proposed_side"] is None
+    assert payload["ml_reason"] is None
+
+
+def test_ml_price_history_endpoint_returns_stable_json_shape(client):
+    row_time = datetime.utcnow().replace(microsecond=0)
+    db.session.add(MLMarketPriceHistory(
+        timestamp=row_time,
+        exchange="Mexc",
+        symbol="TON/USDT",
+        mid_price=2.5,
+        bid=None,
+        ask=None,
+        spread=None,
+        snapshot_age_sec=None,
+    ))
+    db.session.commit()
+
+    response = client.get("/api/orderbook-recovery/ml/price-history?page=1&page_size=10")
+    payload = response.get_json()["obj"]
+
+    assert response.status_code == 200
+    assert payload["items"][0]["timestamp"] == row_time.isoformat()
+    assert payload["items"][0]["bid"] is None
+    assert payload["items"][0]["ask"] is None
+
+
+def test_ml_dataset_serializer_handles_decimal_values():
+    service = OrderBookRecoveryService()
+
+    payload = service.safe_json_payload({
+        "decimal": Decimal("1.23"),
+        "nested": {"created_at": datetime(2026, 1, 1, 12, 0, 0)},
+        "items": [Decimal("2.5"), None],
+    })
+
+    assert payload["decimal"] == 1.23
+    assert payload["nested"]["created_at"] == "2026-01-01T12:00:00"
+    assert payload["items"] == [2.5, None]
 
 
 def test_live_open_order_uses_mocked_ccxt(client):

@@ -216,53 +216,53 @@ class OrderBookRecoveryMLFeatureSnapshotListController(Controller):
     service = OrderBookRecoveryService()
 
     def get(self):
-        return self.service.ml_dataset_query("feature", self.request.args)
+        return self.service.get_ml_feature_snapshots(self.request.args)
 
 
 class OrderBookRecoveryMLFeatureSnapshotDetailController(Controller):
     service = OrderBookRecoveryService()
 
     def get(self, item_id: int):
-        return self.service.ml_dataset_detail("feature", item_id)
+        return self.service.get_ml_feature_snapshot_detail(item_id)
 
 
 class OrderBookRecoveryMLMarketSnapshotListController(Controller):
     service = OrderBookRecoveryService()
 
     def get(self):
-        return self.service.ml_dataset_query("market", self.request.args)
+        return self.service.get_ml_market_snapshots(self.request.args)
 
 
 class OrderBookRecoveryMLMarketSnapshotDetailController(Controller):
     service = OrderBookRecoveryService()
 
     def get(self, item_id: int):
-        return self.service.ml_dataset_detail("market", item_id)
+        return self.service.get_ml_market_snapshot_detail(item_id)
 
 
 class OrderBookRecoveryMLPriceHistoryListController(Controller):
     service = OrderBookRecoveryService()
 
     def get(self):
-        return self.service.ml_dataset_query("price_history", self.request.args)
+        return self.service.get_price_history(self.request.args)
 
 
 class OrderBookRecoveryMLPriceHistoryDetailController(Controller):
     service = OrderBookRecoveryService()
 
     def get(self, item_id: int):
-        return self.service.ml_dataset_detail("price_history", item_id)
+        return self.service.get_price_history_detail(item_id)
 
 
 class OrderBookRecoveryMLExchangeLabelListController(Controller):
     service = OrderBookRecoveryService()
 
     def get(self):
-        return self.service.ml_dataset_query("exchange_label", self.request.args)
+        return self.service.get_ml_exchange_labels(self.request.args)
 
 
 class OrderBookRecoveryMLExchangeLabelDetailController(Controller):
     service = OrderBookRecoveryService()
 
     def get(self, item_id: int):
-        return self.service.ml_dataset_detail("exchange_label", item_id)
+        return self.service.get_ml_exchange_label_detail(item_id)

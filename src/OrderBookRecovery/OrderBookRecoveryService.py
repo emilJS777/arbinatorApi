@@ -1,5 +1,6 @@
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
+from decimal import Decimal
 from threading import Thread
 from io import BytesIO, StringIO
 import csv
@@ -1697,8 +1698,34 @@ class OrderBookRecoveryService(Response):
             snapshot.total_fee = trade.total_fee
         return snapshots
 
+    def safe_json_value(self, value):
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, Decimal):
+            return float(value)
+        if isinstance(value, dict):
+            return {str(key): self.safe_json_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self.safe_json_value(item) for item in value]
+        return value
+
+    def safe_json_payload(self, payload):
+        return {key: self.safe_json_value(value) for key, value in (payload or {}).items()}
+
+    def safe_json_blob(self, value):
+        if value in (None, ""):
+            return None
+        if isinstance(value, (dict, list)):
+            return self.safe_json_value(value)
+        if isinstance(value, str):
+            try:
+                return self.safe_json_value(json.loads(value))
+            except (TypeError, ValueError):
+                return value
+        return self.safe_json_value(value)
+
     def ml_snapshot_to_dict(self, snapshot):
-        return {
+        return self.safe_json_payload({
             "id": snapshot.id,
             "trade_id": snapshot.trade_id,
             "evaluation_id": snapshot.evaluation_id,
@@ -1734,7 +1761,7 @@ class OrderBookRecoveryService(Response):
             "ml_decision": snapshot.ml_decision,
             "ml_reason": snapshot.ml_reason,
             "ml_model_version": snapshot.ml_model_version,
-        }
+        })
 
     def ml_dataset_fields(self):
         return [
@@ -1765,7 +1792,7 @@ class OrderBookRecoveryService(Response):
         snapshot = MLFeatureSnapshot.query.filter_by(exchange=config.exchange, symbol=config.symbol).order_by(MLFeatureSnapshot.timestamp.desc()).first()
         return self.ml_snapshot_to_dict(snapshot) if snapshot else None
 
-    def ml_market_snapshot_to_dict(self, snapshot):
+    def ml_market_snapshot_to_dict(self, snapshot, include_exchange_labels=False):
         payload = {
             "id": snapshot.id,
             "timestamp": snapshot.timestamp,
@@ -1800,11 +1827,12 @@ class OrderBookRecoveryService(Response):
             ]:
                 key = f"{field}_{horizon}s"
                 payload[key] = getattr(snapshot, key, None)
-        payload["exchange_labels"] = [
-            self.ml_exchange_label_to_dict(label)
-            for label in MLMarketSnapshotExchangeLabel.query.filter_by(snapshot_id=snapshot.id).order_by(MLMarketSnapshotExchangeLabel.exchange.asc()).all()
-        ]
-        return payload
+        if include_exchange_labels:
+            payload["exchange_labels"] = [
+                self.ml_exchange_label_to_dict(label)
+                for label in MLMarketSnapshotExchangeLabel.query.filter_by(snapshot_id=snapshot.id).order_by(MLMarketSnapshotExchangeLabel.exchange.asc()).all()
+            ]
+        return self.safe_json_payload(payload)
 
     def ml_exchange_label_to_dict(self, label):
         payload = {
@@ -1823,7 +1851,7 @@ class OrderBookRecoveryService(Response):
             ]:
                 key = f"{field}_{horizon}s"
                 payload[key] = getattr(label, key, None)
-        return payload
+        return self.safe_json_payload(payload)
 
     def ml_exchange_label_fields(self):
         fields = ["id", "snapshot_id", "exchange", "symbol", "reference_price", "label_status", "created_at"]
@@ -1940,7 +1968,7 @@ class OrderBookRecoveryService(Response):
         return send_file(buffer, mimetype="text/csv", as_attachment=True, download_name=f"orderbook-recovery-ml-exchange-labels-{stamp}.csv")
 
     def ml_price_history_to_dict(self, row):
-        return {
+        return self.safe_json_payload({
             "id": row.id,
             "timestamp": row.timestamp,
             "exchange": row.exchange,
@@ -1951,7 +1979,7 @@ class OrderBookRecoveryService(Response):
             "spread": row.spread,
             "snapshot_age_sec": row.snapshot_age_sec,
             "created_at": row.created_at,
-        }
+        })
 
     def ml_price_history_fields(self):
         return ["id", "timestamp", "exchange", "symbol", "mid_price", "bid", "ask", "spread", "snapshot_age_sec", "created_at"]
@@ -2072,7 +2100,7 @@ class OrderBookRecoveryService(Response):
             model = config["model"]
             try:
                 page = max(1, int(args.get("page") or 1))
-                page_size = min(500, max(1, int(args.get("page_size") or 50)))
+                page_size = min(200, max(1, int(args.get("page_size") or args.get("per_page") or 50)))
             except (TypeError, ValueError):
                 page, page_size = 1, 50
             query = self.apply_ml_dataset_filters(dataset, model.query, args)
@@ -2106,16 +2134,42 @@ class OrderBookRecoveryService(Response):
             item = db.session.get(config["model"], item_id)
             if not item:
                 return self.response_not_found("ML dataset item not found")
+            if dataset == "market":
+                return self.response_ok(self.ml_market_snapshot_to_dict(item, include_exchange_labels=True))
             return self.response_ok(config["serializer"](item))
         except Exception as error:
             logger.exception("ML dataset detail failed dataset=%s id=%s: %s", dataset, item_id, error)
             return self.response(False, {"msg": "ml_dataset_detail_unavailable"}, 500)
 
+    def get_ml_feature_snapshots(self, args):
+        return self.ml_dataset_query("feature", args)
+
+    def get_ml_feature_snapshot_detail(self, item_id):
+        return self.ml_dataset_detail("feature", item_id)
+
+    def get_ml_market_snapshots(self, args):
+        return self.ml_dataset_query("market", args)
+
+    def get_ml_market_snapshot_detail(self, item_id):
+        return self.ml_dataset_detail("market", item_id)
+
+    def get_price_history(self, args):
+        return self.ml_dataset_query("price_history", args)
+
+    def get_price_history_detail(self, item_id):
+        return self.ml_dataset_detail("price_history", item_id)
+
+    def get_ml_exchange_labels(self, args):
+        return self.ml_dataset_query("exchange_label", args)
+
+    def get_ml_exchange_label_detail(self, item_id):
+        return self.ml_dataset_detail("exchange_label", item_id)
+
     def export_ml_dataset_filtered(self, dataset, args):
         config = self.ml_dataset_model_config(dataset)
         export_format = str(args.get("format") or "csv").lower()
         rows = [
-            config["serializer"](item)
+            self.ml_market_snapshot_to_dict(item, include_exchange_labels=True) if dataset == "market" else config["serializer"](item)
             for item in self.apply_ml_dataset_filters(dataset, config["model"].query, args).order_by(config["timestamp"].asc()).all()
         ]
         stamp = datetime.utcnow().strftime("%Y-%m-%d-%H-%M")

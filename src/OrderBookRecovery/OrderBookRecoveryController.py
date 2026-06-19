@@ -12,6 +12,13 @@ class OrderBookRecoveryConfigController(Controller):
         return self.service.update_config(self.request.get_json() or {})
 
 
+class OrderBookRecoveryConfigRawController(Controller):
+    service = OrderBookRecoveryService()
+
+    def get(self):
+        return self.service.config_raw_response()
+
+
 class OrderBookRecoveryOptionsController(Controller):
     service = OrderBookRecoveryService()
 

@@ -9,6 +9,7 @@ import time
 from uuid import uuid4
 
 from flask import jsonify, make_response, send_file
+from sqlalchemy import inspect
 from sqlalchemy import or_
 
 from src import db
@@ -90,6 +91,21 @@ class OrderBookRecoveryService(Response):
 
     def config_response(self):
         return self.response_ok(self.config_to_dict(self.get_or_create_config()))
+
+    def config_raw_response(self):
+        config = self.get_or_create_config()
+        db.session.flush()
+        db.session.expire(config)
+        reloaded = db.session.get(OrderBookPatternStrategyConfig, config.id)
+        columns = [column["name"] for column in inspect(db.engine).get_columns(OrderBookPatternStrategyConfig.__tablename__)]
+        return self.response_ok({
+            "config_id": reloaded.id,
+            "db_ml_mode": getattr(reloaded, "ml_mode", None),
+            "serialized_ml_mode": self.config_to_dict(reloaded).get("ml_mode"),
+            "model_default_ml_mode": OrderBookPatternStrategyConfig.ml_mode.default.arg,
+            "ml_mode_column_exists": "ml_mode" in columns,
+            "known_columns": columns,
+        })
 
     def options_response(self):
         exchanges = Exchange.query.filter_by(enabled=True).order_by(Exchange.index.asc()).all()
@@ -223,10 +239,12 @@ class OrderBookRecoveryService(Response):
 
     def update_config(self, body: dict):
         config = self.get_or_create_config()
+        logger.info("OrderBookRecovery config PATCH received keys=%s ml_mode=%s", sorted(body.keys()), body.get("ml_mode"))
         exchange, trading_pair, error = self.resolve_config_selection(body)
         if error:
             return self.validation_error(error)
         self.apply_config_overrides(config, body)
+        logger.info("OrderBookRecovery config after overrides id=%s ml_mode=%s", config.id, config.ml_mode)
         if exchange and trading_pair:
             config.exchange_id = exchange.id
             config.trading_pair_id = trading_pair.id
@@ -239,7 +257,10 @@ class OrderBookRecoveryService(Response):
         if state.current_margin <= 0:
             state.current_margin = config.base_margin_usdt
         db.session.commit()
-        return self.response_ok(self.config_to_dict(config))
+        db.session.expire(config)
+        reloaded = db.session.get(OrderBookPatternStrategyConfig, config.id)
+        logger.info("OrderBookRecovery config committed/reloaded id=%s ml_mode=%s", reloaded.id, reloaded.ml_mode)
+        return self.response_ok(self.config_to_dict(reloaded))
 
     @staticmethod
     def median(values):

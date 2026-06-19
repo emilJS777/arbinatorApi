@@ -1968,6 +1968,18 @@ def test_config_patch_ml_mode_shadow_then_get_returns_shadow(client):
     assert refreshed["ml_mode"] == "shadow"
 
 
+def test_config_raw_reports_db_and_serialized_ml_mode(client):
+    service = OrderBookRecoveryService()
+    make_config(service)
+
+    client.patch("/api/orderbook-recovery/config", json={"ml_mode": "shadow"})
+    raw = client.get("/api/orderbook-recovery/config/raw").get_json()["obj"]
+
+    assert raw["ml_mode_column_exists"] is True
+    assert raw["db_ml_mode"] == "shadow"
+    assert raw["serialized_ml_mode"] == "shadow"
+
+
 def test_start_does_not_reset_ml_mode(client):
     service = OrderBookRecoveryService()
     config = make_config(service)

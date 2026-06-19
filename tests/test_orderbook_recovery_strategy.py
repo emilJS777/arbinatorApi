@@ -2298,6 +2298,113 @@ def test_ml_exchange_labels_export_returns_csv(client):
     assert "Mexc" in payload
 
 
+def test_ml_feature_snapshot_pagination_and_filters(client):
+    db.session.add(MLFeatureSnapshot(
+        evaluation_id="eval-1",
+        timestamp=datetime.utcnow(),
+        symbol="TON/USDT",
+        exchange="Mexc",
+        proposed_side="long",
+        final_side="long",
+        result="win",
+        ml_score=0.7,
+    ))
+    db.session.add(MLFeatureSnapshot(
+        evaluation_id="eval-2",
+        timestamp=datetime.utcnow(),
+        symbol="BTC/USDT",
+        exchange="Binance",
+        proposed_side="short",
+        final_side="none",
+        result="loss",
+        ml_score=None,
+    ))
+    db.session.commit()
+
+    response = client.get("/api/orderbook-recovery/ml/feature-snapshots?page=1&page_size=1&exchange=Mexc&side=long&has_ml_score=true")
+    payload = response.get_json()["obj"]
+
+    assert response.status_code == 200
+    assert payload["page"] == 1
+    assert payload["page_size"] == 1
+    assert payload["total"] == 1
+    assert payload["items"][0]["exchange"] == "Mexc"
+
+
+def test_ml_market_snapshot_detail_endpoint(client):
+    snapshot = MLMarketSnapshot(
+        timestamp=datetime.utcnow(),
+        exchange="Mexc",
+        symbol="TON/USDT",
+        reference_price=100,
+        label_status="pending",
+    )
+    db.session.add(snapshot)
+    db.session.commit()
+
+    response = client.get(f"/api/orderbook-recovery/ml/market-snapshots/{snapshot.id}")
+    payload = response.get_json()["obj"]
+
+    assert response.status_code == 200
+    assert payload["id"] == snapshot.id
+    assert payload["reference_price"] == 100
+
+
+def test_ml_price_history_pagination_filters(client):
+    db.session.add(MLMarketPriceHistory(
+        timestamp=datetime.utcnow(),
+        exchange="Mexc",
+        symbol="TON/USDT",
+        mid_price=2.5,
+        bid=2.49,
+        ask=2.51,
+    ))
+    db.session.add(MLMarketPriceHistory(
+        timestamp=datetime.utcnow(),
+        exchange="Binance",
+        symbol="BTC/USDT",
+        mid_price=100,
+    ))
+    db.session.commit()
+
+    response = client.get("/api/orderbook-recovery/ml/price-history?symbol=TON&exchange=Mexc")
+    payload = response.get_json()["obj"]
+
+    assert response.status_code == 200
+    assert payload["total"] == 1
+    assert payload["items"][0]["mid_price"] == 2.5
+
+
+def test_ml_exchange_label_export_respects_filters(client):
+    first = MLMarketSnapshot(
+        timestamp=datetime.utcnow(),
+        exchange="Mexc",
+        symbol="TON/USDT",
+        reference_price=100,
+        label_status="pending",
+    )
+    second = MLMarketSnapshot(
+        timestamp=datetime.utcnow(),
+        exchange="Binance",
+        symbol="BTC/USDT",
+        reference_price=100,
+        label_status="pending",
+    )
+    db.session.add(first)
+    db.session.add(second)
+    db.session.commit()
+    db.session.add(MLMarketSnapshotExchangeLabel(snapshot_id=first.id, exchange="Mexc", symbol="TON/USDT", reference_price=100, label_status="labeled"))
+    db.session.add(MLMarketSnapshotExchangeLabel(snapshot_id=second.id, exchange="Binance", symbol="BTC/USDT", reference_price=100, label_status="pending"))
+    db.session.commit()
+
+    response = client.get("/api/orderbook-recovery/ml/exchange-labels/export?format=json&exchange=Mexc&label_status=labeled")
+    payload = json.loads(response.data.decode("utf-8"))
+
+    assert response.status_code == 200
+    assert len(payload) == 1
+    assert payload[0]["exchange"] == "Mexc"
+
+
 def test_live_open_order_uses_mocked_ccxt(client):
     mock_client = MockLiveClient()
     live_service = LiveExecutionService(client_factory=lambda exchange: mock_client)

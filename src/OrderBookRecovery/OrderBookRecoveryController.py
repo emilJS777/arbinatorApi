@@ -174,21 +174,88 @@ class OrderBookRecoveryMLDatasetExportController(Controller):
     service = OrderBookRecoveryService()
 
     def get(self):
-        export_format = str(self.request.args.get("format", "csv")).lower()
-        return self.service.export_ml_dataset(export_format)
+        return self.service.export_ml_dataset_filtered("feature", self.request.args)
+
+
+class OrderBookRecoveryMLFeatureSnapshotExportController(Controller):
+    service = OrderBookRecoveryService()
+
+    def get(self):
+        return self.service.export_ml_dataset_filtered("feature", self.request.args)
 
 
 class OrderBookRecoveryMLMarketSnapshotExportController(Controller):
     service = OrderBookRecoveryService()
 
     def get(self):
-        export_format = str(self.request.args.get("format", "csv")).lower()
-        return self.service.export_ml_market_snapshots(export_format)
+        return self.service.export_ml_dataset_filtered("market", self.request.args)
 
 
 class OrderBookRecoveryMLExchangeLabelsExportController(Controller):
     service = OrderBookRecoveryService()
 
     def get(self):
-        export_format = str(self.request.args.get("format", "csv")).lower()
-        return self.service.export_ml_exchange_labels(export_format)
+        return self.service.export_ml_dataset_filtered("exchange_label", self.request.args)
+
+
+class OrderBookRecoveryMLPriceHistoryExportController(Controller):
+    service = OrderBookRecoveryService()
+
+    def get(self):
+        return self.service.export_ml_dataset_filtered("price_history", self.request.args)
+
+
+class OrderBookRecoveryMLFeatureSnapshotListController(Controller):
+    service = OrderBookRecoveryService()
+
+    def get(self):
+        return self.service.ml_dataset_query("feature", self.request.args)
+
+
+class OrderBookRecoveryMLFeatureSnapshotDetailController(Controller):
+    service = OrderBookRecoveryService()
+
+    def get(self, item_id: int):
+        return self.service.ml_dataset_detail("feature", item_id)
+
+
+class OrderBookRecoveryMLMarketSnapshotListController(Controller):
+    service = OrderBookRecoveryService()
+
+    def get(self):
+        return self.service.ml_dataset_query("market", self.request.args)
+
+
+class OrderBookRecoveryMLMarketSnapshotDetailController(Controller):
+    service = OrderBookRecoveryService()
+
+    def get(self, item_id: int):
+        return self.service.ml_dataset_detail("market", item_id)
+
+
+class OrderBookRecoveryMLPriceHistoryListController(Controller):
+    service = OrderBookRecoveryService()
+
+    def get(self):
+        return self.service.ml_dataset_query("price_history", self.request.args)
+
+
+class OrderBookRecoveryMLPriceHistoryDetailController(Controller):
+    service = OrderBookRecoveryService()
+
+    def get(self, item_id: int):
+        return self.service.ml_dataset_detail("price_history", item_id)
+
+
+class OrderBookRecoveryMLExchangeLabelListController(Controller):
+    service = OrderBookRecoveryService()
+
+    def get(self):
+        return self.service.ml_dataset_query("exchange_label", self.request.args)
+
+
+class OrderBookRecoveryMLExchangeLabelDetailController(Controller):
+    service = OrderBookRecoveryService()
+
+    def get(self, item_id: int):
+        return self.service.ml_dataset_detail("exchange_label", item_id)

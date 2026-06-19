@@ -1913,6 +1913,185 @@ class OrderBookRecoveryService(Response):
         buffer = BytesIO(output.getvalue().encode("utf-8"))
         return send_file(buffer, mimetype="text/csv", as_attachment=True, download_name=f"orderbook-recovery-ml-exchange-labels-{stamp}.csv")
 
+    def ml_price_history_to_dict(self, row):
+        return {
+            "id": row.id,
+            "timestamp": row.timestamp,
+            "exchange": row.exchange,
+            "symbol": row.symbol,
+            "mid_price": row.mid_price,
+            "bid": row.bid,
+            "ask": row.ask,
+            "spread": row.spread,
+            "snapshot_age_sec": row.snapshot_age_sec,
+            "created_at": row.created_at,
+        }
+
+    def ml_price_history_fields(self):
+        return ["id", "timestamp", "exchange", "symbol", "mid_price", "bid", "ask", "spread", "snapshot_age_sec", "created_at"]
+
+    def parse_bool_filter(self, value):
+        if value is None or value == "":
+            return None
+        return str(value).lower() in {"1", "true", "yes", "y"}
+
+    def parse_datetime_filter(self, value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return None
+
+    def ml_dataset_model_config(self, dataset):
+        configs = {
+            "feature": {
+                "model": MLFeatureSnapshot,
+                "serializer": self.ml_snapshot_to_dict,
+                "fields": self.ml_dataset_fields,
+                "timestamp": MLFeatureSnapshot.timestamp,
+                "sort": {
+                    "id": MLFeatureSnapshot.id,
+                    "timestamp": MLFeatureSnapshot.timestamp,
+                    "symbol": MLFeatureSnapshot.symbol,
+                    "exchange": MLFeatureSnapshot.exchange,
+                    "side": MLFeatureSnapshot.final_side,
+                    "result": MLFeatureSnapshot.result,
+                    "ml_score": MLFeatureSnapshot.ml_score,
+                },
+            },
+            "market": {
+                "model": MLMarketSnapshot,
+                "serializer": self.ml_market_snapshot_to_dict,
+                "fields": self.ml_market_dataset_fields,
+                "timestamp": MLMarketSnapshot.timestamp,
+                "sort": {
+                    "id": MLMarketSnapshot.id,
+                    "timestamp": MLMarketSnapshot.timestamp,
+                    "symbol": MLMarketSnapshot.symbol,
+                    "exchange": MLMarketSnapshot.exchange,
+                    "label_status": MLMarketSnapshot.label_status,
+                    "future_return_10s": MLMarketSnapshot.future_return_10s,
+                    "median_future_return_10s": MLMarketSnapshot.median_future_return_10s,
+                },
+            },
+            "price_history": {
+                "model": MLMarketPriceHistory,
+                "serializer": self.ml_price_history_to_dict,
+                "fields": self.ml_price_history_fields,
+                "timestamp": MLMarketPriceHistory.timestamp,
+                "sort": {
+                    "id": MLMarketPriceHistory.id,
+                    "timestamp": MLMarketPriceHistory.timestamp,
+                    "symbol": MLMarketPriceHistory.symbol,
+                    "exchange": MLMarketPriceHistory.exchange,
+                    "mid_price": MLMarketPriceHistory.mid_price,
+                },
+            },
+            "exchange_label": {
+                "model": MLMarketSnapshotExchangeLabel,
+                "serializer": self.ml_exchange_label_to_dict,
+                "fields": self.ml_exchange_label_fields,
+                "timestamp": MLMarketSnapshotExchangeLabel.created_at,
+                "sort": {
+                    "id": MLMarketSnapshotExchangeLabel.id,
+                    "snapshot_id": MLMarketSnapshotExchangeLabel.snapshot_id,
+                    "symbol": MLMarketSnapshotExchangeLabel.symbol,
+                    "exchange": MLMarketSnapshotExchangeLabel.exchange,
+                    "label_status": MLMarketSnapshotExchangeLabel.label_status,
+                    "future_return_10s": MLMarketSnapshotExchangeLabel.future_return_10s,
+                },
+            },
+        }
+        return configs[dataset]
+
+    def apply_ml_dataset_filters(self, dataset, query, args):
+        args = args or {}
+        config = self.ml_dataset_model_config(dataset)
+        model = config["model"]
+        symbol = args.get("symbol")
+        exchange = args.get("exchange")
+        if symbol and hasattr(model, "symbol"):
+            query = query.filter(model.symbol.ilike(f"%{symbol}%"))
+        if exchange and hasattr(model, "exchange"):
+            query = query.filter(model.exchange.ilike(f"%{exchange}%"))
+        date_from = self.parse_datetime_filter(args.get("date_from"))
+        date_to = self.parse_datetime_filter(args.get("date_to"))
+        timestamp_column = config["timestamp"]
+        if date_from:
+            query = query.filter(timestamp_column >= date_from)
+        if date_to:
+            query = query.filter(timestamp_column <= date_to)
+        if dataset == "feature":
+            side = args.get("side")
+            if side:
+                query = query.filter(or_(MLFeatureSnapshot.proposed_side == side, MLFeatureSnapshot.final_side == side))
+            result = args.get("result")
+            if result:
+                query = query.filter(MLFeatureSnapshot.result == result)
+            has_ml_score = self.parse_bool_filter(args.get("has_ml_score"))
+            if has_ml_score is True:
+                query = query.filter(MLFeatureSnapshot.ml_score.isnot(None))
+            elif has_ml_score is False:
+                query = query.filter(MLFeatureSnapshot.ml_score.is_(None))
+        if dataset in {"market", "exchange_label"}:
+            label_status = args.get("label_status")
+            if label_status:
+                query = query.filter(model.label_status == label_status)
+        return query
+
+    def ml_dataset_query(self, dataset, args):
+        config = self.ml_dataset_model_config(dataset)
+        model = config["model"]
+        try:
+            page = max(1, int(args.get("page") or 1))
+            page_size = min(500, max(1, int(args.get("page_size") or 50)))
+        except (TypeError, ValueError):
+            page, page_size = 1, 50
+        query = self.apply_ml_dataset_filters(dataset, model.query, args)
+        total = query.count()
+        sort_by = args.get("sort_by") or "timestamp"
+        sort_column = config["sort"].get(sort_by) or config["sort"].get("timestamp") or model.id
+        sort_dir = str(args.get("sort_dir") or "desc").lower()
+        query = query.order_by(sort_column.asc() if sort_dir == "asc" else sort_column.desc())
+        items = query.offset((page - 1) * page_size).limit(page_size).all()
+        return self.response_ok({
+            "items": [config["serializer"](item) for item in items],
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": (total + page_size - 1) // page_size if total else 0,
+        })
+
+    def ml_dataset_detail(self, dataset, item_id):
+        config = self.ml_dataset_model_config(dataset)
+        item = db.session.get(config["model"], item_id)
+        if not item:
+            return self.response_not_found("ML dataset item not found")
+        return self.response_ok(config["serializer"](item))
+
+    def export_ml_dataset_filtered(self, dataset, args):
+        config = self.ml_dataset_model_config(dataset)
+        export_format = str(args.get("format") or "csv").lower()
+        rows = [
+            config["serializer"](item)
+            for item in self.apply_ml_dataset_filters(dataset, config["model"].query, args).order_by(config["timestamp"].asc()).all()
+        ]
+        stamp = datetime.utcnow().strftime("%Y-%m-%d-%H-%M")
+        if export_format == "json":
+            payload = json.dumps(rows, default=str, ensure_ascii=False, indent=2)
+            buffer = BytesIO(payload.encode("utf-8"))
+            return send_file(buffer, mimetype="application/json", as_attachment=True, download_name=f"orderbook-recovery-ml-{dataset}-{stamp}.json")
+        output = StringIO()
+        writer = csv.DictWriter(output, fieldnames=config["fields"]())
+        writer.writeheader()
+        for row in rows:
+            if "exchange_labels" in row:
+                row["exchange_labels"] = json.dumps(row.get("exchange_labels") or [], default=str, ensure_ascii=False)
+        writer.writerows(rows)
+        buffer = BytesIO(output.getvalue().encode("utf-8"))
+        return send_file(buffer, mimetype="text/csv", as_attachment=True, download_name=f"orderbook-recovery-ml-{dataset}-{stamp}.csv")
+
     def pending_key(self, config):
         return self.debug_key(config)
 

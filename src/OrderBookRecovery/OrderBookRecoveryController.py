@@ -176,3 +176,11 @@ class OrderBookRecoveryMLDatasetExportController(Controller):
     def get(self):
         export_format = str(self.request.args.get("format", "csv")).lower()
         return self.service.export_ml_dataset(export_format)
+
+
+class OrderBookRecoveryMLMarketSnapshotExportController(Controller):
+    service = OrderBookRecoveryService()
+
+    def get(self):
+        export_format = str(self.request.args.get("format", "csv")).lower()
+        return self.service.export_ml_market_snapshots(export_format)

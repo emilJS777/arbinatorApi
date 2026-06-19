@@ -12,7 +12,7 @@ from src import db
 from src.Arbitrage.OrderBookSnapshotStore import OrderBookSnapshotStore
 from src.Exchange.ExchangeModel import Exchange
 from src.OrderBookRecovery.LiveExecutionService import LiveExecutionService
-from src.OrderBookRecovery.OrderBookRecoveryModel import MLFeatureSnapshot, StrategyRunTrade
+from src.OrderBookRecovery.OrderBookRecoveryModel import MLFeatureSnapshot, MLMarketSnapshot, StrategyRunTrade
 from src.OrderBookRecovery.OrderBookNormalizer import OrderBookNormalizer
 from src.OrderBookRecovery.OrderBookRecoveryService import OrderBookRecoveryService
 
@@ -2064,6 +2064,127 @@ def test_ml_dataset_export_returns_json(client):
     assert payload
     assert payload[0]["symbol"] == "TON/USDT"
     assert "ml_score" in payload[0]
+
+
+def test_ml_market_snapshot_saved_in_shadow_mode(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.ml_mode = "shadow"
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+
+    result = service.evaluate(config)
+    snapshots = MLMarketSnapshot.query.order_by(MLMarketSnapshot.id.asc()).all()
+
+    assert result["side"] == "long"
+    assert len(snapshots) >= 1
+    assert snapshots[0].symbol == "TON/USDT"
+    assert snapshots[0].exchange == "Mexc"
+    assert snapshots[0].reference_price > 0
+    assert snapshots[0].label_status == "pending"
+
+
+def test_ml_market_snapshot_not_saved_when_disabled(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.ml_mode = "disabled"
+    config.feedback_enabled = False
+    db.session.commit()
+    setup_long_consensus(service, config)
+
+    service.evaluate(config)
+
+    assert MLMarketSnapshot.query.count() == 0
+
+
+def test_ml_market_labeling_calculates_future_return(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.ml_mode = "shadow"
+    config.take_profit_percent_of_margin = 1
+    config.live_fee_filter_taker_fee_percent = 0
+    now = datetime.utcnow()
+    db.session.add(MLMarketSnapshot(
+        timestamp=now - timedelta(seconds=61),
+        exchange="Mexc",
+        symbol="TON/USDT",
+        reference_price=100,
+        label_status="pending",
+    ))
+    db.session.commit()
+    add_snapshot("Mexc", bid=101, ask=101.02)
+
+    result = service.label_pending_market_snapshots(config, now)
+    snapshot = MLMarketSnapshot.query.first()
+
+    assert result["updated"] == 1
+    assert snapshot.label_status == "labeled"
+    assert round(snapshot.future_price_10s, 2) == 101.01
+    assert round(snapshot.future_return_10s, 4) == 0.0101
+
+
+def test_ml_market_long_short_labels_calculated(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    config.ml_mode = "shadow"
+    config.take_profit_percent_of_margin = 1
+    config.live_fee_filter_taker_fee_percent = 0
+    now = datetime.utcnow()
+    db.session.add(MLMarketSnapshot(
+        timestamp=now - timedelta(seconds=61),
+        exchange="Mexc",
+        symbol="TON/USDT",
+        reference_price=100,
+        label_status="pending",
+    ))
+    db.session.add(MLMarketSnapshot(
+        timestamp=now - timedelta(seconds=61),
+        exchange="Mexc",
+        symbol="TON/USDT",
+        reference_price=103,
+        label_status="pending",
+    ))
+    db.session.commit()
+    add_snapshot("Mexc", bid=101, ask=101.02)
+
+    service.label_pending_market_snapshots(config, now)
+    first, second = MLMarketSnapshot.query.order_by(MLMarketSnapshot.id.asc()).all()
+
+    assert first.long_would_win_10s is True
+    assert first.short_would_win_10s is False
+    assert second.long_would_win_10s is False
+    assert second.short_would_win_10s is True
+
+
+def test_ml_market_snapshot_export_returns_json(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.exchange = "Mexc"
+    config.symbol = "TON/USDT"
+    db.session.add(MLMarketSnapshot(
+        timestamp=datetime.utcnow(),
+        exchange="Mexc",
+        symbol="TON/USDT",
+        reference_price=100,
+        label_status="pending",
+    ))
+    db.session.commit()
+
+    response = client.get("/api/orderbook-recovery/ml/market-snapshots/export?format=json")
+    payload = json.loads(response.data.decode("utf-8"))
+
+    assert response.status_code == 200
+    assert payload[0]["symbol"] == "TON/USDT"
+    assert "future_return_10s" in payload[0]
 
 
 def test_live_open_order_uses_mocked_ccxt(client):

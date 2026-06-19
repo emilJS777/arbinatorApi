@@ -5,6 +5,7 @@ from io import BytesIO, StringIO
 import csv
 import json
 import logging
+import random
 import time
 from uuid import uuid4
 
@@ -17,6 +18,7 @@ from src.Arbitrage.OrderBookSnapshotStore import OrderBookSnapshotStore
 from src.Exchange.ExchangeModel import Exchange
 from src.OrderBookRecovery.OrderBookRecoveryModel import (
     MLFeatureSnapshot,
+    MLMarketSnapshot,
     OrderBookPatternStrategyConfig,
     RecoveryState,
     StrategyRun,
@@ -45,6 +47,7 @@ class OrderBookRecoveryService(Response):
     _pending_entries = {}
     _last_confirmation_results = {}
     _live_market_infos = {}
+    _ml_labeler_started = False
     _signal_diagnostics = defaultdict(lambda: deque(maxlen=500))
     _signal_counters = defaultdict(lambda: {
         "long_signals_count": 0,
@@ -209,6 +212,10 @@ class OrderBookRecoveryService(Response):
             "side_quality_lookback_trades",
             "side_quality_cooldown_seconds",
             "ml_mode",
+            "ml_snapshot_capture_enabled",
+            "ml_snapshot_sample_rate",
+            "ml_label_horizons_seconds",
+            "ml_max_snapshots_per_hour",
             "cooldown_after_max_recovery_seconds",
             "feedback_enabled",
             "feedback_lookback_trades",
@@ -234,6 +241,9 @@ class OrderBookRecoveryService(Response):
         config.side_quality_cooldown_seconds = max(0, int(config.side_quality_cooldown_seconds or 0))
         if config.ml_mode not in {"disabled", "shadow"}:
             config.ml_mode = "disabled"
+        config.ml_snapshot_sample_rate = min(1, max(0, float(config.ml_snapshot_sample_rate if config.ml_snapshot_sample_rate is not None else 1)))
+        config.ml_label_horizons_seconds = json.dumps(self.ml_label_horizons(config))
+        config.ml_max_snapshots_per_hour = max(1, int(config.ml_max_snapshots_per_hour or 10000))
         config.signal_diagnostics_max_rows = min(500, max(20, int(config.signal_diagnostics_max_rows or 100)))
         config.paper_mode_only = True
 
@@ -294,6 +304,7 @@ class OrderBookRecoveryService(Response):
         db.session.add(run)
         db.session.commit()
         logger.info("OrderBookRecovery strategy started: exchange=%s symbol=%s run_id=%s", config.exchange, config.symbol, run.id)
+        self.start_ml_market_labeler()
         payload = self.state_payload(config, state)
         self.publisher.publish("orderbook_recovery.started", payload)
         return self.response_ok(payload)
@@ -458,12 +469,39 @@ class OrderBookRecoveryService(Response):
 
         duration_minutes = max(0.01, float(body.get("duration_minutes", 30)))
         self.schedule_forward_test_stop(run.id, duration_minutes)
+        self.start_ml_market_labeler()
         return self.response_ok({
             "run_id": run.id,
             "status": run.status,
             "duration_minutes": duration_minutes,
             "config": self.config_to_dict(config),
         })
+
+    def start_ml_market_labeler(self):
+        if self.__class__._ml_labeler_started:
+            return
+        self.__class__._ml_labeler_started = True
+
+        def worker():
+            from src import app
+
+            while True:
+                time.sleep(5)
+                with app.app_context():
+                    try:
+                        configs = OrderBookPatternStrategyConfig.query.filter(
+                            OrderBookPatternStrategyConfig.ml_mode == "shadow",
+                            OrderBookPatternStrategyConfig.ml_snapshot_capture_enabled.is_(True),
+                        ).all()
+                        for config in configs:
+                            self.label_pending_market_snapshots(config)
+                    except Exception as error:
+                        db.session.rollback()
+                        logger.warning("ML market snapshot labeler failed: %s", error)
+                    finally:
+                        db.session.remove()
+
+        Thread(target=worker, daemon=True).start()
 
     def schedule_forward_test_stop(self, run_id: int, duration_minutes: float):
         def worker():
@@ -847,6 +885,16 @@ class OrderBookRecoveryService(Response):
         open_trade = self.open_trade(config)
         if open_trade:
             self.store_last_evaluation(config, features, long_signal, short_signal, "none", None, current_time)
+            self.create_ml_market_snapshot(
+                config,
+                state,
+                features,
+                self.consensus_snapshot(config, current_time) if config.consensus_enabled else {},
+                "open_position",
+                open_trade.side,
+                None,
+                current_time,
+            )
             closed = self.evaluate_open_trade(open_trade, features["mid_price"], state, config, current_time)
             if closed:
                 logger.info("OrderBookRecovery evaluation result: managed open position trade_id=%s result=closed", open_trade.id)
@@ -1066,6 +1114,16 @@ class OrderBookRecoveryService(Response):
         final_side = final_side or "none"
         state = self.get_or_create_state(config)
         ml_snapshot = self.create_ml_feature_snapshot(config, state, features, consensus, proposed_side, final_side, evaluated_at)
+        self.create_ml_market_snapshot(
+            config,
+            state,
+            features,
+            consensus,
+            proposed_side,
+            final_side,
+            reject_reason or consensus.get("reject_reason"),
+            evaluated_at,
+        )
         ml_prediction = consensus.get("ml_prediction") or (
             self.ml_snapshot_to_dict(ml_snapshot) if ml_snapshot else {}
         )
@@ -1309,6 +1367,156 @@ class OrderBookRecoveryService(Response):
         consensus["ml_feature_snapshot_id"] = snapshot.id
         return snapshot
 
+    def ml_label_horizons(self, config):
+        value = getattr(config, "ml_label_horizons_seconds", None) or [10, 30, 60]
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                value = [10, 30, 60]
+        allowed = {10, 30, 60}
+        horizons = []
+        for item in value if isinstance(value, list) else [10, 30, 60]:
+            try:
+                horizon = int(item)
+            except (TypeError, ValueError):
+                continue
+            if horizon in allowed and horizon not in horizons:
+                horizons.append(horizon)
+        return horizons or [10, 30, 60]
+
+    def ml_market_capture_enabled(self, config):
+        return self.ml_enabled(config) and bool(getattr(config, "ml_snapshot_capture_enabled", True))
+
+    def ml_required_future_return(self, config):
+        margin = float(config.base_margin_usdt or 0)
+        leverage = float(config.leverage or 1)
+        notional = margin * leverage
+        if notional <= 0:
+            return 0
+        target_profit = margin * (float(config.take_profit_percent_of_margin or 0) / 100)
+        taker_fee_percent = float(getattr(config, "live_fee_filter_taker_fee_percent", 0) or 0)
+        estimated_roundtrip_fee = notional * (taker_fee_percent / 100) * 2
+        return (target_profit + estimated_roundtrip_fee) / notional
+
+    def snapshot_mid_price(self, snapshot):
+        order_book = (snapshot or {}).get("order_book") or {}
+        normalized, error = OrderBookNormalizer.normalize(order_book)
+        if error:
+            return None, error
+        bids = normalized["bids"]
+        asks = normalized["asks"]
+        best_bid = float(bids[0]["price"])
+        best_ask = float(asks[0]["price"])
+        if best_bid <= 0 or best_ask <= 0 or best_ask < best_bid:
+            return None, "invalid_price_amount"
+        return (best_bid + best_ask) / 2, None
+
+    def should_capture_ml_market_snapshot(self, config, evaluated_at):
+        if not self.ml_market_capture_enabled(config):
+            return False
+        sample_rate = min(1, max(0, float(getattr(config, "ml_snapshot_sample_rate", 1) or 0)))
+        if sample_rate <= 0 or (sample_rate < 1 and random.random() > sample_rate):
+            return False
+        cap = max(1, int(getattr(config, "ml_max_snapshots_per_hour", 10000) or 10000))
+        since = evaluated_at - timedelta(hours=1)
+        count = MLMarketSnapshot.query.filter(
+            MLMarketSnapshot.exchange == config.exchange,
+            MLMarketSnapshot.symbol == config.symbol,
+            MLMarketSnapshot.timestamp >= since,
+        ).count()
+        return count < cap
+
+    def create_ml_market_snapshot(
+        self,
+        config,
+        state,
+        features=None,
+        consensus=None,
+        proposed_side=None,
+        final_side=None,
+        reject_reason=None,
+        evaluated_at=None,
+    ):
+        evaluated_at = evaluated_at or datetime.utcnow()
+        features = features or {}
+        consensus = consensus or {}
+        reference_price = features.get("mid_price")
+        if reference_price is None or not self.should_capture_ml_market_snapshot(config, evaluated_at):
+            return None
+        snapshot = self.latest_snapshot_for(config) or {}
+        source_time = snapshot.get("updated_at")
+        market_snapshot = MLMarketSnapshot(
+            timestamp=evaluated_at,
+            symbol=config.symbol,
+            exchange=config.exchange,
+            reference_price=float(reference_price),
+            median_imbalance=consensus.get("median_imbalance"),
+            raw_avg_imbalance=consensus.get("raw_average_imbalance"),
+            spread=features.get("spread_percent") or consensus.get("configured_exchange_spread"),
+            momentum=consensus.get("average_momentum", features.get("short_momentum")),
+            valid_exchanges_count=consensus.get("valid_exchanges_count"),
+            long_confirms=consensus.get("confirming_long_count"),
+            short_confirms=consensus.get("confirming_short_count"),
+            long_ratio=consensus.get("consensus_ratio_long"),
+            short_ratio=consensus.get("consensus_ratio_short"),
+            anomaly_count=consensus.get("anomalous_exchanges_count"),
+            snapshot_age_sec=(source_time and (evaluated_at - source_time).total_seconds()),
+            configured_exchange_long_signal=consensus.get("configured_exchange_long_signal"),
+            configured_exchange_short_signal=consensus.get("configured_exchange_short_signal"),
+            proposed_side=proposed_side,
+            final_side=final_side,
+            reject_reason=reject_reason or consensus.get("reject_reason"),
+            created_at=datetime.utcnow(),
+            label_status="pending",
+        )
+        db.session.add(market_snapshot)
+        db.session.commit()
+        return market_snapshot
+
+    def label_pending_market_snapshots(self, config=None, current_time=None):
+        config = config or self.get_or_create_config()
+        current_time = current_time or datetime.utcnow()
+        snapshot = self.snapshot_for(config.exchange, config.symbol)
+        if not snapshot:
+            return {"updated": 0, "reason": "no_valid_order_book_snapshot"}
+        current_price, error = self.snapshot_mid_price(snapshot)
+        if current_price is None:
+            return {"updated": 0, "reason": error}
+        current_price = float(current_price)
+        required_return = self.ml_required_future_return(config)
+        horizons = self.ml_label_horizons(config)
+        pending = (
+            MLMarketSnapshot.query.filter_by(exchange=config.exchange, symbol=config.symbol, label_status="pending")
+            .order_by(MLMarketSnapshot.timestamp.asc())
+            .limit(1000)
+            .all()
+        )
+        updated = 0
+        for item in pending:
+            age = (current_time - item.timestamp).total_seconds()
+            touched = False
+            for horizon in horizons:
+                price_attr = f"future_price_{horizon}s"
+                return_attr = f"future_return_{horizon}s"
+                long_attr = f"long_would_win_{horizon}s"
+                short_attr = f"short_would_win_{horizon}s"
+                if age >= horizon and getattr(item, price_attr) is None and item.reference_price:
+                    future_return = (current_price - float(item.reference_price)) / float(item.reference_price)
+                    setattr(item, price_attr, current_price)
+                    setattr(item, return_attr, future_return)
+                    setattr(item, long_attr, future_return >= required_return)
+                    setattr(item, short_attr, future_return <= -required_return)
+                    touched = True
+            if all(getattr(item, f"future_price_{horizon}s") is not None for horizon in horizons):
+                item.label_status = "labeled"
+                touched = True
+            if touched:
+                updated += 1
+        if updated:
+            db.session.commit()
+        return {"updated": updated, "required_return": required_return, "current_price": current_price}
+
     def update_ml_snapshots_for_trade(self, trade):
         snapshots = MLFeatureSnapshot.query.filter_by(trade_id=trade.id).all()
         for snapshot in snapshots:
@@ -1385,6 +1593,82 @@ class OrderBookRecoveryService(Response):
     def latest_ml_snapshot_for_config(self, config):
         snapshot = MLFeatureSnapshot.query.filter_by(exchange=config.exchange, symbol=config.symbol).order_by(MLFeatureSnapshot.timestamp.desc()).first()
         return self.ml_snapshot_to_dict(snapshot) if snapshot else None
+
+    def ml_market_snapshot_to_dict(self, snapshot):
+        return {
+            "id": snapshot.id,
+            "timestamp": snapshot.timestamp,
+            "symbol": snapshot.symbol,
+            "exchange": snapshot.exchange,
+            "reference_price": snapshot.reference_price,
+            "median_imbalance": snapshot.median_imbalance,
+            "raw_avg_imbalance": snapshot.raw_avg_imbalance,
+            "spread": snapshot.spread,
+            "momentum": snapshot.momentum,
+            "valid_exchanges_count": snapshot.valid_exchanges_count,
+            "long_confirms": snapshot.long_confirms,
+            "short_confirms": snapshot.short_confirms,
+            "long_ratio": snapshot.long_ratio,
+            "short_ratio": snapshot.short_ratio,
+            "anomaly_count": snapshot.anomaly_count,
+            "snapshot_age_sec": snapshot.snapshot_age_sec,
+            "configured_exchange_long_signal": snapshot.configured_exchange_long_signal,
+            "configured_exchange_short_signal": snapshot.configured_exchange_short_signal,
+            "proposed_side": snapshot.proposed_side,
+            "final_side": snapshot.final_side,
+            "reject_reason": snapshot.reject_reason,
+            "created_at": snapshot.created_at,
+            "future_price_10s": snapshot.future_price_10s,
+            "future_return_10s": snapshot.future_return_10s,
+            "long_would_win_10s": snapshot.long_would_win_10s,
+            "short_would_win_10s": snapshot.short_would_win_10s,
+            "future_price_30s": snapshot.future_price_30s,
+            "future_return_30s": snapshot.future_return_30s,
+            "long_would_win_30s": snapshot.long_would_win_30s,
+            "short_would_win_30s": snapshot.short_would_win_30s,
+            "future_price_60s": snapshot.future_price_60s,
+            "future_return_60s": snapshot.future_return_60s,
+            "long_would_win_60s": snapshot.long_would_win_60s,
+            "short_would_win_60s": snapshot.short_would_win_60s,
+            "label_status": snapshot.label_status,
+        }
+
+    def ml_market_dataset_fields(self):
+        return [
+            "id", "timestamp", "symbol", "exchange", "reference_price", "median_imbalance", "raw_avg_imbalance",
+            "spread", "momentum", "valid_exchanges_count", "long_confirms", "short_confirms", "long_ratio",
+            "short_ratio", "anomaly_count", "snapshot_age_sec", "configured_exchange_long_signal",
+            "configured_exchange_short_signal", "proposed_side", "final_side", "reject_reason", "created_at",
+            "future_price_10s", "future_return_10s", "long_would_win_10s", "short_would_win_10s",
+            "future_price_30s", "future_return_30s", "long_would_win_30s", "short_would_win_30s",
+            "future_price_60s", "future_return_60s", "long_would_win_60s", "short_would_win_60s",
+            "label_status",
+        ]
+
+    def ml_market_snapshot_stats(self, config):
+        query = MLMarketSnapshot.query.filter_by(exchange=config.exchange, symbol=config.symbol)
+        return {
+            "total": query.count(),
+            "pending": query.filter_by(label_status="pending").count(),
+            "labeled": query.filter_by(label_status="labeled").count(),
+        }
+
+    def export_ml_market_snapshots(self, export_format="csv"):
+        config = self.get_or_create_config()
+        self.label_pending_market_snapshots(config)
+        snapshots = MLMarketSnapshot.query.order_by(MLMarketSnapshot.timestamp.asc()).all()
+        rows = [self.ml_market_snapshot_to_dict(snapshot) for snapshot in snapshots]
+        stamp = datetime.utcnow().strftime("%Y-%m-%d-%H-%M")
+        if export_format == "json":
+            payload = json.dumps(rows, default=str, ensure_ascii=False, indent=2)
+            buffer = BytesIO(payload.encode("utf-8"))
+            return send_file(buffer, mimetype="application/json", as_attachment=True, download_name=f"orderbook-recovery-ml-market-snapshots-{stamp}.json")
+        output = StringIO()
+        writer = csv.DictWriter(output, fieldnames=self.ml_market_dataset_fields())
+        writer.writeheader()
+        writer.writerows(rows)
+        buffer = BytesIO(output.getvalue().encode("utf-8"))
+        return send_file(buffer, mimetype="text/csv", as_attachment=True, download_name=f"orderbook-recovery-ml-market-snapshots-{stamp}.csv")
 
     def pending_key(self, config):
         return self.debug_key(config)
@@ -1624,6 +1908,8 @@ class OrderBookRecoveryService(Response):
         confirmation = self.__class__._last_confirmation_results.get(self.pending_key(config)) or {}
         live_market = self.live_market_debug(config)
         signal_diagnostics = self.signal_diagnostics_for(config)
+        self.label_pending_market_snapshots(config)
+        ml_market_stats = self.ml_market_snapshot_stats(config)
         latest_ml_snapshot = self.latest_ml_snapshot_for_config(config)
         margin_limit = self.live_execution_service.margin_limit_debug(
             config,
@@ -1660,6 +1946,9 @@ class OrderBookRecoveryService(Response):
             "ml_decision": (latest_ml_snapshot or {}).get("ml_decision"),
             "ml_reason": (latest_ml_snapshot or {}).get("ml_reason"),
             "ml_model_version": (latest_ml_snapshot or {}).get("ml_model_version"),
+            "ml_market_snapshots_count": ml_market_stats["total"],
+            "ml_market_snapshots_pending_count": ml_market_stats["pending"],
+            "ml_market_snapshots_labeled_count": ml_market_stats["labeled"],
             "entry_mode": config.entry_mode,
             "resolved_live_symbol": live_market.get("resolved_live_symbol"),
             "live_market_type": live_market.get("live_market_type"),
@@ -2624,6 +2913,10 @@ class OrderBookRecoveryService(Response):
             "side_quality_lookback_trades": config.side_quality_lookback_trades,
             "side_quality_cooldown_seconds": config.side_quality_cooldown_seconds,
             "ml_mode": config.ml_mode,
+            "ml_snapshot_capture_enabled": config.ml_snapshot_capture_enabled,
+            "ml_snapshot_sample_rate": config.ml_snapshot_sample_rate,
+            "ml_label_horizons_seconds": self.ml_label_horizons(config),
+            "ml_max_snapshots_per_hour": config.ml_max_snapshots_per_hour,
             "cooldown_after_max_recovery_seconds": config.cooldown_after_max_recovery_seconds,
             "feedback_enabled": config.feedback_enabled,
             "feedback_lookback_trades": config.feedback_lookback_trades,

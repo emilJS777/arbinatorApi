@@ -1,8 +1,9 @@
 from src import api
 
-from src.Health.HealthController import HealthController, ReadinessController
+from src.Health.HealthController import ApiHealthController, HealthController, ReadinessController
 api.add_resource(HealthController, "/healthz")
 api.add_resource(ReadinessController, "/readyz")
+api.add_resource(ApiHealthController, "/api/health")
 
 from src.Live.LiveDiagnosticsController import MexcDiagnosticsController, MexcOrderSubmitDryCheckController, MexcTpSlDryCheckController
 api.add_resource(MexcDiagnosticsController, "/api/live/mexc-diagnostics")

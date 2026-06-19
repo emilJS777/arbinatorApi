@@ -16,3 +16,12 @@ class ReadinessController(Controller):
         finally:
             db.session.remove()
         return {"status": "ok"}
+
+
+class ApiHealthController(Controller):
+    def get(self):
+        try:
+            db.session.execute(text("SELECT 1"))
+        finally:
+            db.session.remove()
+        return {"success": True, "obj": {"status": "ok"}}

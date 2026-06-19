@@ -40,6 +40,24 @@ def test_readyz_performs_lightweight_select(client, monkeypatch):
     assert len(calls) == 1
 
 
+def test_api_health_performs_lightweight_select(client, monkeypatch):
+    calls = []
+    original_execute = db.session.execute
+
+    def spy_execute(statement, *args, **kwargs):
+        calls.append(str(statement))
+        return original_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db.session, "execute", spy_execute)
+
+    response = client.get("/api/health")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"success": True, "obj": {"status": "ok"}}
+    assert any("SELECT 1" in statement for statement in calls)
+    assert len(calls) == 1
+
+
 def test_request_teardown_removes_scoped_session(client, monkeypatch):
     calls = []
     original_remove = db.session.remove

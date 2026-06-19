@@ -42,6 +42,13 @@ migrate = Migrate(app, db)
 
 @app.teardown_request
 def cleanup_db_session(_exception=None):
+    if _exception is not None:
+        logger.error(
+            "request failed path=%s method=%s",
+            request.path,
+            request.method,
+            exc_info=(_exception.__class__, _exception, _exception.__traceback__),
+        )
     db.session.remove()
 
 # LOGGING

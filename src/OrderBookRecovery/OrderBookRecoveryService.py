@@ -1877,6 +1877,32 @@ class OrderBookRecoveryService(Response):
             "exchange_label_completion_percent": (label_labeled / label_total * 100) if label_total else 0,
         }
 
+    def ml_stats_response(self):
+        try:
+            config = self.get_or_create_config()
+            stats = self.ml_market_snapshot_stats(config)
+            return self.response_ok({
+                "ml_market_snapshots_count": stats["total"],
+                "ml_market_snapshots_pending_count": stats["pending"],
+                "ml_market_snapshots_labeled_count": stats["labeled"],
+                "ml_exchange_labels_count": stats["exchange_labels_total"],
+                "ml_exchange_labels_pending_count": stats["exchange_labels_pending"],
+                "ml_exchange_labels_labeled_count": stats["exchange_labels_labeled"],
+                "ml_exchange_label_completion_percent": stats["exchange_label_completion_percent"],
+            })
+        except Exception as error:
+            logger.exception("ML stats endpoint failed: %s", error)
+            return self.response(False, {
+                "msg": "ml_stats_unavailable",
+                "ml_market_snapshots_count": -1,
+                "ml_market_snapshots_pending_count": -1,
+                "ml_market_snapshots_labeled_count": -1,
+                "ml_exchange_labels_count": -1,
+                "ml_exchange_labels_pending_count": -1,
+                "ml_exchange_labels_labeled_count": -1,
+                "ml_exchange_label_completion_percent": -1,
+            }, 500)
+
     def export_ml_market_snapshots(self, export_format="csv"):
         config = self.get_or_create_config()
         self.label_pending_market_snapshots(config)
@@ -2041,34 +2067,49 @@ class OrderBookRecoveryService(Response):
         return query
 
     def ml_dataset_query(self, dataset, args):
-        config = self.ml_dataset_model_config(dataset)
-        model = config["model"]
         try:
-            page = max(1, int(args.get("page") or 1))
-            page_size = min(500, max(1, int(args.get("page_size") or 50)))
-        except (TypeError, ValueError):
-            page, page_size = 1, 50
-        query = self.apply_ml_dataset_filters(dataset, model.query, args)
-        total = query.count()
-        sort_by = args.get("sort_by") or "timestamp"
-        sort_column = config["sort"].get(sort_by) or config["sort"].get("timestamp") or model.id
-        sort_dir = str(args.get("sort_dir") or "desc").lower()
-        query = query.order_by(sort_column.asc() if sort_dir == "asc" else sort_column.desc())
-        items = query.offset((page - 1) * page_size).limit(page_size).all()
-        return self.response_ok({
-            "items": [config["serializer"](item) for item in items],
-            "page": page,
-            "page_size": page_size,
-            "total": total,
-            "total_pages": (total + page_size - 1) // page_size if total else 0,
-        })
+            config = self.ml_dataset_model_config(dataset)
+            model = config["model"]
+            try:
+                page = max(1, int(args.get("page") or 1))
+                page_size = min(500, max(1, int(args.get("page_size") or 50)))
+            except (TypeError, ValueError):
+                page, page_size = 1, 50
+            query = self.apply_ml_dataset_filters(dataset, model.query, args)
+            total = query.count()
+            sort_by = args.get("sort_by") or "timestamp"
+            sort_column = config["sort"].get(sort_by) or config["sort"].get("timestamp") or model.id
+            sort_dir = str(args.get("sort_dir") or "desc").lower()
+            query = query.order_by(sort_column.asc() if sort_dir == "asc" else sort_column.desc())
+            items = query.offset((page - 1) * page_size).limit(page_size).all()
+            return self.response_ok({
+                "items": [config["serializer"](item) for item in items],
+                "page": page,
+                "page_size": page_size,
+                "total": total,
+                "total_pages": (total + page_size - 1) // page_size if total else 0,
+            })
+        except Exception as error:
+            logger.exception("ML dataset list failed dataset=%s: %s", dataset, error)
+            return self.response(False, {
+                "msg": "ml_dataset_unavailable",
+                "items": [],
+                "page": 1,
+                "page_size": 50,
+                "total": 0,
+                "total_pages": 0,
+            }, 500)
 
     def ml_dataset_detail(self, dataset, item_id):
-        config = self.ml_dataset_model_config(dataset)
-        item = db.session.get(config["model"], item_id)
-        if not item:
-            return self.response_not_found("ML dataset item not found")
-        return self.response_ok(config["serializer"](item))
+        try:
+            config = self.ml_dataset_model_config(dataset)
+            item = db.session.get(config["model"], item_id)
+            if not item:
+                return self.response_not_found("ML dataset item not found")
+            return self.response_ok(config["serializer"](item))
+        except Exception as error:
+            logger.exception("ML dataset detail failed dataset=%s id=%s: %s", dataset, item_id, error)
+            return self.response(False, {"msg": "ml_dataset_detail_unavailable"}, 500)
 
     def export_ml_dataset_filtered(self, dataset, args):
         config = self.ml_dataset_model_config(dataset)

@@ -2405,6 +2405,19 @@ def test_ml_exchange_label_export_respects_filters(client):
     assert payload[0]["exchange"] == "Mexc"
 
 
+def test_ml_stats_endpoint_returns_numeric_shape(client):
+    response = client.get("/api/orderbook-recovery/ml/stats")
+    payload = response.get_json()["obj"]
+
+    assert response.status_code == 200
+    assert payload["ml_market_snapshots_count"] == 0
+    assert payload["ml_market_snapshots_pending_count"] == 0
+    assert payload["ml_market_snapshots_labeled_count"] == 0
+    assert payload["ml_exchange_labels_count"] == 0
+    assert payload["ml_exchange_labels_pending_count"] == 0
+    assert payload["ml_exchange_labels_labeled_count"] == 0
+
+
 def test_live_open_order_uses_mocked_ccxt(client):
     mock_client = MockLiveClient()
     live_service = LiveExecutionService(client_factory=lambda exchange: mock_client)

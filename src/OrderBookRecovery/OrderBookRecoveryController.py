@@ -177,6 +177,13 @@ class OrderBookRecoveryMLDatasetExportController(Controller):
         return self.service.export_ml_dataset_filtered("feature", self.request.args)
 
 
+class OrderBookRecoveryMLStatsController(Controller):
+    service = OrderBookRecoveryService()
+
+    def get(self):
+        return self.service.ml_stats_response()
+
+
 class OrderBookRecoveryMLFeatureSnapshotExportController(Controller):
     service = OrderBookRecoveryService()
 

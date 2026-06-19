@@ -1955,6 +1955,34 @@ def test_ml_disabled_mode_does_not_store_feature_snapshots(client):
     assert MLFeatureSnapshot.query.count() == 0
 
 
+def test_config_patch_ml_mode_shadow_then_get_returns_shadow(client):
+    service = OrderBookRecoveryService()
+    make_config(service)
+
+    response = client.patch("/api/orderbook-recovery/config", json={"ml_mode": "shadow"})
+    payload = response.get_json()["obj"]
+    refreshed = client.get("/api/orderbook-recovery/config").get_json()["obj"]
+
+    assert response.status_code == 200
+    assert payload["ml_mode"] == "shadow"
+    assert refreshed["ml_mode"] == "shadow"
+
+
+def test_start_does_not_reset_ml_mode(client):
+    service = OrderBookRecoveryService()
+    config = make_config(service)
+    config.ml_mode = "shadow"
+    db.session.commit()
+
+    response = client.post("/api/orderbook-recovery/start-paper")
+    refreshed = client.get("/api/orderbook-recovery/config").get_json()["obj"]
+    state = client.get("/api/orderbook-recovery/state").get_json()["obj"]
+
+    assert response.status_code == 200
+    assert refreshed["ml_mode"] == "shadow"
+    assert state["config"]["ml_mode"] == "shadow"
+
+
 def test_ml_shadow_mode_stores_feature_snapshot(client):
     service = OrderBookRecoveryService()
     config = make_config(service)

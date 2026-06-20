@@ -57,16 +57,35 @@ logging.basicConfig(level=getattr(logging, log_level, logging.INFO))
 logger = logging.getLogger(f"{datetime.utcnow()}")
 request_timing_logger = logging.getLogger("arbinator.request_timing")
 TIMED_REQUEST_PATHS = {
+    "/api/orderbook-recovery/state",
     "/api/orderbook-recovery/metrics",
     "/api/orderbook-recovery/debug",
     "/api/orderbook-recovery/trades",
+    "/api/orderbook-recovery/trades/export",
+    "/api/orderbook-recovery/ml/stats",
+    "/api/orderbook-recovery/ml/dataset/export",
+    "/api/orderbook-recovery/ml/feature-snapshots",
+    "/api/orderbook-recovery/ml/feature-snapshots/export",
+    "/api/orderbook-recovery/ml/market-snapshots",
+    "/api/orderbook-recovery/ml/market-snapshots/export",
+    "/api/orderbook-recovery/ml/price-history",
+    "/api/orderbook-recovery/ml/price-history/export",
+    "/api/orderbook-recovery/ml/exchange-labels",
+    "/api/orderbook-recovery/ml/exchange-labels/export",
     "/api/scanner/diagnostics",
 }
+TIMED_REQUEST_PREFIXES = (
+    "/api/orderbook-recovery/ml/feature-snapshots/",
+    "/api/orderbook-recovery/ml/market-snapshots/",
+    "/api/orderbook-recovery/ml/price-history/",
+    "/api/orderbook-recovery/ml/exchange-labels/",
+)
+SLOW_REQUEST_WARNING_MS = int(os.getenv("SLOW_REQUEST_WARNING_MS", "1000"))
 
 
 @app.before_request
 def mark_timed_request_start():
-    if request.path in TIMED_REQUEST_PATHS:
+    if request.path in TIMED_REQUEST_PATHS or request.path.startswith(TIMED_REQUEST_PREFIXES):
         g.request_started_at = time.perf_counter()
 
 
@@ -75,7 +94,8 @@ def log_timed_request(response):
     started_at = getattr(g, "request_started_at", None)
     if started_at is not None:
         duration_ms = (time.perf_counter() - started_at) * 1000
-        request_timing_logger.info(
+        log = request_timing_logger.warning if duration_ms >= SLOW_REQUEST_WARNING_MS else request_timing_logger.info
+        log(
             "request_timing path=%s method=%s status=%s duration_ms=%.2f",
             request.path,
             request.method,

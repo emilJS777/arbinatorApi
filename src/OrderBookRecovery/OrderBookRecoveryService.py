@@ -3349,6 +3349,8 @@ class OrderBookRecoveryService(Response):
         return consecutive_wins, consecutive_losses
 
     def state_payload(self, config, state):
+        open_trade = self.open_trade(config)
+        latest_snapshot = self.latest_snapshot_for(config)
         margin_limit = self.live_execution_service.margin_limit_debug(
             config,
             state.current_margin or config.base_margin_usdt,
@@ -3363,20 +3365,22 @@ class OrderBookRecoveryService(Response):
             "symbol": config.symbol,
             "exchange_id": config.exchange_id,
             "trading_pair_id": config.trading_pair_id,
-            "open_position": self.trade_to_dict(self.open_trade(config)) if self.open_trade(config) else None,
+            "open_position": self.trade_to_dict(open_trade) if open_trade else None,
             "last_evaluation": self.last_evaluation_for(config),
-            "latest_snapshot": self.latest_snapshot_for(config),
-            "last_order_book_snapshot_time": (self.latest_snapshot_for(config) or {}).get("updated_at"),
+            "latest_snapshot": latest_snapshot,
+            "last_order_book_snapshot_time": (latest_snapshot or {}).get("updated_at"),
             "reason_if_not_trading": self.reason_if_not_trading(config, state),
             "live_market": self.live_market_debug(config),
             **margin_limit,
-            "metrics": self.metrics_without_state_query(config),
+            "metrics": self.metrics_without_state_query(config, open_trade=open_trade),
         }
 
-    def metrics_without_state_query(self, config):
+    def metrics_without_state_query(self, config, open_trade=None):
         trades = self.metrics_trades_query(config).filter_by(is_archived=False).all()
         archived_trades = self.metrics_trades_query(config).filter_by(is_archived=True).all()
-        return self.calculate_metrics(trades, config.paper_equity_usdt, self.open_trade(config), archived_trades)
+        if open_trade is None:
+            open_trade = self.open_trade(config)
+        return self.calculate_metrics(trades, config.paper_equity_usdt, open_trade, archived_trades)
 
     def metrics_trades_query(self, config=None):
         query = self.closed_trades_query(config).filter(or_(StrategyRunTrade.live_status.is_(None), StrategyRunTrade.live_status != "open_failed"))

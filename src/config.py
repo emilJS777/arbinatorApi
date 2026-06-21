@@ -63,6 +63,7 @@ TIMED_REQUEST_PATHS = {
     "/api/orderbook-recovery/trades",
     "/api/orderbook-recovery/trades/export",
     "/api/orderbook-recovery/ml/stats",
+    "/api/orderbook-recovery/ml/dataset/clear",
     "/api/orderbook-recovery/ml/dataset/export",
     "/api/orderbook-recovery/ml/feature-snapshots",
     "/api/orderbook-recovery/ml/feature-snapshots/export",

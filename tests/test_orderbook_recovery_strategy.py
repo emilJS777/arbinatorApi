@@ -2419,6 +2419,51 @@ def test_ml_stats_endpoint_returns_numeric_shape(client):
     assert payload["ml_exchange_labels_labeled_count"] == 0
 
 
+def test_ml_dataset_clear_endpoint_deletes_collected_rows(client):
+    market_snapshot = MLMarketSnapshot(
+        timestamp=datetime.utcnow(),
+        exchange="Mexc",
+        symbol="TON/USDT",
+        reference_price=3.2,
+        label_status="pending",
+    )
+    db.session.add(market_snapshot)
+    db.session.flush()
+    db.session.add(MLMarketSnapshotExchangeLabel(
+        snapshot_id=market_snapshot.id,
+        exchange="Mexc",
+        symbol="TON/USDT",
+        reference_price=3.2,
+        label_status="pending",
+    ))
+    db.session.add(MLMarketPriceHistory(
+        timestamp=datetime.utcnow(),
+        exchange="Mexc",
+        symbol="TON/USDT",
+        mid_price=3.2,
+    ))
+    db.session.add(MLFeatureSnapshot(
+        evaluation_id="eval-clear-test",
+        timestamp=datetime.utcnow(),
+        exchange="Mexc",
+        symbol="TON/USDT",
+    ))
+    db.session.commit()
+
+    response = client.post("/api/orderbook-recovery/ml/dataset/clear")
+    payload = response.get_json()["obj"]
+
+    assert response.status_code == 200
+    assert payload["exchange_labels_deleted"] == 1
+    assert payload["market_snapshots_deleted"] == 1
+    assert payload["price_history_deleted"] == 1
+    assert payload["feature_snapshots_deleted"] == 1
+    assert MLMarketSnapshotExchangeLabel.query.count() == 0
+    assert MLMarketSnapshot.query.count() == 0
+    assert MLMarketPriceHistory.query.count() == 0
+    assert MLFeatureSnapshot.query.count() == 0
+
+
 def test_ml_dataset_empty_endpoints_return_stable_shapes(client):
     endpoints = [
         "/api/orderbook-recovery/ml/feature-snapshots",

@@ -1931,6 +1931,25 @@ class OrderBookRecoveryService(Response):
                 "ml_exchange_label_completion_percent": -1,
             }, 500)
 
+    def clear_ml_dataset(self):
+        try:
+            counts = {
+                "exchange_labels_deleted": MLMarketSnapshotExchangeLabel.query.delete(synchronize_session=False),
+                "market_snapshots_deleted": MLMarketSnapshot.query.delete(synchronize_session=False),
+                "price_history_deleted": MLMarketPriceHistory.query.delete(synchronize_session=False),
+                "feature_snapshots_deleted": MLFeatureSnapshot.query.delete(synchronize_session=False),
+            }
+            db.session.commit()
+            logger.warning("OrderBookRecovery ML dataset cleared: %s", counts)
+            return self.response_ok({
+                **counts,
+                "msg": "ml_dataset_cleared",
+            })
+        except Exception as error:
+            db.session.rollback()
+            logger.exception("ML dataset clear failed: %s", error)
+            return self.response(False, {"msg": "ml_dataset_clear_failed"}, 500)
+
     def export_ml_market_snapshots(self, export_format="csv"):
         config = self.get_or_create_config()
         self.label_pending_market_snapshots(config)

@@ -184,6 +184,13 @@ class OrderBookRecoveryMLStatsController(Controller):
         return self.service.ml_stats_response()
 
 
+class OrderBookRecoveryMLDatasetClearController(Controller):
+    service = OrderBookRecoveryService()
+
+    def post(self):
+        return self.service.clear_ml_dataset()
+
+
 class OrderBookRecoveryMLFeatureSnapshotExportController(Controller):
     service = OrderBookRecoveryService()
 

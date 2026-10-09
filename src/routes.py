@@ -69,6 +69,8 @@ api.add_resource(OrderBookRecoveryConfigController, "/api/orderbook-recovery/con
 api.add_resource(OrderBookRecoveryConfigRawController, "/api/orderbook-recovery/config/raw")
 api.add_resource(OrderBookRecoveryOptionsController, "/api/orderbook-recovery/options")
 api.add_resource(OrderBookRecoveryStartController, "/api/orderbook-recovery/start-paper")
+from src.OrderBookRecovery.OrderBookRecoveryController import OrderBookRecoveryPaperSessionController
+api.add_resource(OrderBookRecoveryPaperSessionController, "/api/orderbook-recovery/paper-sessions")
 api.add_resource(OrderBookRecoveryStopController, "/api/orderbook-recovery/stop")
 api.add_resource(OrderBookRecoveryStateController, "/api/orderbook-recovery/state")
 api.add_resource(OrderBookRecoveryTradeController, "/api/orderbook-recovery/trades")

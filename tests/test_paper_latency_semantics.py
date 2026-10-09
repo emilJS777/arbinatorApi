@@ -75,6 +75,7 @@ def test_gross_tp_can_close_at_net_loss(client):
     config.take_profit_percent_of_margin = .1
     config.leverage = 1
     now = datetime.utcnow()
+    service.exchange_feature(config, book(price=99, at=now - timedelta(seconds=1)), now)
     snapshot = book(at=now)
     store(snapshot)
     service.snapshot_for = lambda *_: snapshot

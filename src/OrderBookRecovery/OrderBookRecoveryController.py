@@ -41,6 +41,13 @@ class OrderBookRecoveryStopController(Controller):
         return self.service.stop(body.get("reason") or "manual_stop")
 
 
+class OrderBookRecoveryPaperSessionController(Controller):
+    service = OrderBookRecoveryService()
+
+    def post(self):
+        return self.service.new_paper_session()
+
+
 class OrderBookRecoveryStateController(Controller):
     service = OrderBookRecoveryService()
 

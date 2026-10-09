@@ -11,7 +11,11 @@ class SignalFeedbackService:
             StrategyRunTrade.strategy_config_id == config.id,
             StrategyRunTrade.closed_at.isnot(None),
             StrategyRunTrade.is_archived.is_(False),
+            StrategyRunTrade.execution_mode == config.execution_mode,
+            StrategyRunTrade.result.in_(["win", "loss"]),
         )
+        if config.execution_mode == "paper":
+            query = query.filter(StrategyRunTrade.paper_session_id == getattr(config, "paper_session_id", None))
         if side:
             query = query.filter_by(side=side)
         return query.order_by(StrategyRunTrade.closed_at.desc()).limit(limit or int(config.feedback_lookback_trades)).all()

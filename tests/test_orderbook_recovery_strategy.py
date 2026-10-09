@@ -77,7 +77,12 @@ def open_trade(service, config, side="long", entry=100):
         datetime.utcnow(),
     )
     trade = db.session.get(StrategyRunTrade, result["id"])
-    service.evaluate_open_trade(trade, entry, state, service.trade_config(config, trade), datetime.utcnow())
+    # Exit tests start with an already-filled fixture; pending entry validation
+    # is covered separately by test_paper_sessions_pending on the real service path.
+    if trade.execution_mode == "paper":
+        trade.live_status = None
+        trade.live_entry_fee = 0
+        db.session.commit()
     return service.trade_to_dict(trade)
 
 
@@ -421,7 +426,7 @@ def test_manual_close_loss_keeps_bounded_margin(client):
     assert state.current_margin == config.base_margin_usdt
 
 
-def test_manual_close_without_valid_market_price_returns_error(client):
+def test_manual_close_without_valid_market_price_is_unresolved(client):
     service = OrderBookRecoveryService()
     config = make_config(service)
     open_trade(service, config, "long", 100)
@@ -431,8 +436,8 @@ def test_manual_close_without_valid_market_price_returns_error(client):
     response = client.post(f"/api/orderbook-recovery/positions/{trade.id}/close-manual", json={"reason": "manual_close"})
 
     data = response.get_json()
-    assert data["success"] is False
-    assert data["obj"]["msg"] == "cannot_close_without_valid_market_price"
+    assert data["success"] is True  # Close intent accepted, NOT a confirmed fill.
+    assert data["obj"]["paper_exit_status"] == "unresolved_no_fresh_book_or_depth"
     assert trade.closed_at is None
 
 
@@ -975,6 +980,7 @@ def test_after_long_loss_strategy_can_open_short_when_signal_flips(client):
     setup_long_consensus(service, config)
     first = service.evaluate(config)
     long_trade = db.session.get(StrategyRunTrade, first["id"])
+    service.evaluate(config)  # Fill the validated pending entry before testing a loss.
     state = service.get_or_create_state(config)
     service.close_trade(long_trade, 90, -1, "stop_loss", state, config, datetime.utcnow())
     OrderBookSnapshotStore.clear()
@@ -3772,12 +3778,13 @@ def test_frontend_exchange_tpsl_fields_visible():
     frontend_view = Path("/Users/emilhambardzumyan/WebstormProjects/arbinator/src/views/orderBookRecovery/v-order-book-recovery.vue").read_text()
 
     assert "TP/SL protection" in frontend_view
-    assert "Exchange TP/SL not created" in frontend_view
+    assert "protectionLabel" in frontend_view
     assert "Exchange position already closed" in frontend_view
     assert "Closed externally on exchange" in frontend_view
     assert "exit_price_warning" in frontend_view
     assert "pnl_source" in frontend_view
-    assert "tp_sl_protected" in frontend_view
+    helper = Path("/Users/emilhambardzumyan/WebstormProjects/arbinator/src/utils/workspacePresentation.js").read_text()
+    assert "tp_sl_protected" in helper
     assert "exchange_tp_price" in frontend_view
     assert "exchange_sl_price" in frontend_view
     assert "exchange_tp_order_id" in frontend_view
@@ -3800,7 +3807,7 @@ def test_frontend_entry_mode_controls_exist():
     assert "Live enabled confirmation" in frontend_view
     assert "Live kill switch" in frontend_view
     assert "WARNING: Live mode places real orders on the selected exchange." in frontend_view
-    assert "You are enabling LIVE trading. Real orders may be placed on the exchange." in frontend_view
+    assert "Live activation locked" in frontend_view
     assert "Live max margin USDT" in frontend_view
     assert "Resolved live symbol" in frontend_view
     assert "Live market type" in frontend_view

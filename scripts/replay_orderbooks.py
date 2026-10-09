@@ -216,7 +216,7 @@ def replay(rows, config_overrides, symbol, split_time, baseline=False, end_time=
                 equity_now += service.calculate_pnl(active.side, active.entry_price, liquidation, active.notional) - float(active.total_fee or 0) - active.amount * liquidation * config.paper_taker_fee_percent / 100 + float(active.funding_pnl or 0)
             mtm_peak = max(mtm_peak, equity_now)
             mtm_dd = max(mtm_dd, (mtm_peak - equity_now) / mtm_peak * 100)
-        trades = StrategyRunTrade.query.filter(StrategyRunTrade.closed_at.isnot(None)).order_by(StrategyRunTrade.closed_at).all()
+        trades = service.metrics_trades_query(config).order_by(StrategyRunTrade.closed_at).all()
         results = [{"side": t.side, "entry": t.entry_price, "exit": t.exit_price, "gross_pnl": t.gross_pnl,
                     "net_pnl": t.pnl, "fee": t.total_fee, "opened_at": t.opened_at.isoformat(), "closed_at": t.closed_at.isoformat()} for t in trades]
         pnls = [t.pnl for t in trades]
@@ -232,7 +232,7 @@ def replay(rows, config_overrides, symbol, split_time, baseline=False, end_time=
                 missing[reason] += count
         all_trades = StrategyRunTrade.query.all()
         seconds = max(0, (last_at - first_evaluation).total_seconds()) if last_at and first_evaluation else 0
-        filled = [t for t in all_trades if t.live_status not in {"paper_pending", "paper_rejected", "open_failed"} and t.result != "rejected"]
+        filled = [t for t in all_trades if t.live_status not in {"paper_pending", "paper_cancelled", "paper_rejected", "open_failed"} and t.result != "rejected"]
         exposure = sum(max(0, ((t.closed_at or last_at) - max(t.opened_at, split_time)).total_seconds()) for t in filled) if last_at else 0
         if funding_scenario is not None:
             missing.pop("settled_funding_input_missing", None)

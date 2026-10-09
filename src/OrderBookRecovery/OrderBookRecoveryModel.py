@@ -80,10 +80,21 @@ class OrderBookPatternStrategyConfig(Model, db.Model):
     emergency_entry_block = db.Column(db.Boolean, default=True, nullable=False)
     paper_taker_fee_percent = db.Column(db.Float, default=0.1, nullable=False)
     paper_latency_ms = db.Column(db.Integer, default=250, nullable=False)
+    pending_entry_ttl_seconds = db.Column(db.Float, default=5, nullable=False)
+    paper_session_id = db.Column(db.String(36), db.ForeignKey("orderbook_paper_session.id"), nullable=True)
     max_consecutive_losses = db.Column(db.Integer, default=3, nullable=False)
     max_leverage = db.Column(db.Float, default=2, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class PaperSession(db.Model):
+    __tablename__ = "orderbook_paper_session"
+    id = db.Column(db.String(36), primary_key=True)
+    strategy_config_id = db.Column(db.Integer, nullable=False, index=True)
+    initial_equity_usdt = db.Column(db.Float, nullable=False)
+    started_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    ended_at = db.Column(db.DateTime, nullable=True)
 
 
 class RecoveryState(Model, db.Model):
@@ -121,6 +132,9 @@ class StrategyRunTrade(Model, db.Model):
     __tablename__ = "strategy_run_trade"
 
     strategy_run_id = db.Column(db.Integer, db.ForeignKey("strategy_run.id"), nullable=True)
+    paper_session_id = db.Column(db.String(36), db.ForeignKey("orderbook_paper_session.id"), nullable=True, index=True)
+    pending_entry_expires_at = db.Column(db.DateTime, nullable=True)
+    paper_exit_status = db.Column(db.String(100), nullable=True)
     strategy_config_id = db.Column(db.Integer, db.ForeignKey("order_book_pattern_strategy_config.id"), nullable=False)
     strategy_run = db.relationship("StrategyRun")
     strategy_config = db.relationship("OrderBookPatternStrategyConfig")

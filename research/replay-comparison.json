@@ -1,0 +1,32 @@
+{
+  "chronological_test_start": "2026-10-08T12:31:03.777000",
+  "tuning_performed": false,
+  "baseline": {
+    "variant": "baseline_raw_price_momentum",
+    "test_evaluations": 4,
+    "trades_count": 0,
+    "total_net_pnl": 0,
+    "expectancy": null,
+    "profit_factor": null,
+    "max_drawdown_percent": 0,
+    "open_position_at_end": false,
+    "trades": []
+  },
+  "improved": {
+    "variant": "timestamp_normalized_momentum",
+    "test_evaluations": 4,
+    "trades_count": 0,
+    "total_net_pnl": 0,
+    "expectancy": null,
+    "profit_factor": null,
+    "max_drawdown_percent": 0,
+    "open_position_at_end": false,
+    "trades": []
+  },
+  "limitations": [
+    "Baseline isolates momentum changes, not a full reconstruction of historical production behavior.",
+    "No candles used. Fill uses observed depth after latency; queue priority and intervening liquidity are unobserved.",
+    "Funding cash flows are not modeled. Sample length and trade count must support any statistical claim.",
+    "Warmup is chronological first 70%; last 30% is test, parameters fixed before evaluation."
+  ]
+}

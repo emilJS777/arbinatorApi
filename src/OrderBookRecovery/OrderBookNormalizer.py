@@ -25,14 +25,15 @@ class OrderBookNormalizer:
             return None, "empty_bids"
         if not asks:
             return None, "empty_asks"
-        return {"bids": bids, "asks": asks}, None
+        return {"bids": sorted(bids, key=lambda row: row["price"], reverse=True),
+                "asks": sorted(asks, key=lambda row: row["price"])}, None
 
     @staticmethod
     def normalize_side(rows):
         result = []
         for row in rows:
             price, amount = OrderBookNormalizer.extract_price_amount(row)
-            if price is None or amount is None or price <= 0 or amount < 0:
+            if price is None or amount is None or not price.is_finite() or not amount.is_finite() or price <= 0 or amount < 0:
                 return None
             result.append({"price": price, "amount": amount})
         return result

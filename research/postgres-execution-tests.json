@@ -1,0 +1,19 @@
+{
+  "passed": [
+    "concurrent_open_single_submit",
+    "concurrent_close_single_submit",
+    "crash_after_accept_read_only_recovery",
+    "crash_before_submit_no_blind_retry",
+    "crash_before_commit_database_rollback",
+    "ambiguous_plan_after_crash_not_duplicated",
+    "active_plan_expiry_detected",
+    "cancelled_protection_detected",
+    "legacy_without_evidence_quarantined",
+    "legacy_order_evidence_verified_without_submit",
+    "funding_signed_idempotent_net_accounting"
+  ],
+  "count": 11,
+  "database": "isolated PostgreSQL",
+  "exchange": "loopback HTTP emulator, NOT real MEXC",
+  "real_orders_sent": false
+}

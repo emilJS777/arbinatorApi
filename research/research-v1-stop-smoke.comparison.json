@@ -1,0 +1,758 @@
+{
+  "notional_usdt": 20.0,
+  "results": [
+    {
+      "exchange": "binance",
+      "symbol": "BTC/USDT",
+      "samples": 1,
+      "fresh_samples": 1,
+      "fresh_fraction": 1.0,
+      "median_spread_percent": 0.00012373213231397124,
+      "min_two_sided_depth_usdt": 108377.14359999998,
+      "buy_fill_fraction": 1.0,
+      "sell_fill_fraction": 1.0,
+      "median_buy_slippage_percent": 0.0,
+      "median_sell_slippage_percent": 0.0,
+      "observed_return_std": null,
+      "funding": {
+        "fundingRate": 2.154e-05,
+        "fundingTimestamp": 1791504000000,
+        "nextFundingTimestamp": null,
+        "interval": null,
+        "source": "projection_not_settled_cashflow"
+      },
+      "contract_limits": {
+        "leverage": {
+          "min": null,
+          "max": null
+        },
+        "amount": {
+          "min": 0.001,
+          "max": 1000.0
+        },
+        "price": {
+          "min": 556.8,
+          "max": 4529764.0
+        },
+        "cost": {
+          "min": 50.0,
+          "max": null
+        },
+        "market": {
+          "min": 0.001,
+          "max": 120.0
+        }
+      },
+      "contract_precision": {
+        "amount": 0.001,
+        "price": 0.1,
+        "cost": null,
+        "base": 1e-08,
+        "quote": 1e-08
+      }
+    },
+    {
+      "exchange": "binance",
+      "symbol": "ETH/USDT",
+      "samples": 1,
+      "fresh_samples": 1,
+      "fresh_fraction": 1.0,
+      "median_spread_percent": 0.0004125999781224445,
+      "min_two_sided_depth_usdt": 73859.37179000002,
+      "buy_fill_fraction": 1.0,
+      "sell_fill_fraction": 1.0,
+      "median_buy_slippage_percent": 0.0,
+      "median_sell_slippage_percent": 0.0,
+      "observed_return_std": null,
+      "funding": {
+        "fundingRate": 1.172e-05,
+        "fundingTimestamp": 1791504000000,
+        "nextFundingTimestamp": null,
+        "interval": null,
+        "source": "projection_not_settled_cashflow"
+      },
+      "contract_limits": {
+        "leverage": {
+          "min": null,
+          "max": null
+        },
+        "amount": {
+          "min": 0.001,
+          "max": 10000.0
+        },
+        "price": {
+          "min": 39.86,
+          "max": 306177.0
+        },
+        "cost": {
+          "min": 20.0,
+          "max": null
+        },
+        "market": {
+          "min": 0.001,
+          "max": 2000.0
+        }
+      },
+      "contract_precision": {
+        "amount": 0.001,
+        "price": 0.01,
+        "cost": null,
+        "base": 1e-08,
+        "quote": 1e-08
+      }
+    },
+    {
+      "exchange": "binance",
+      "symbol": "SOL/USDT",
+      "samples": 1,
+      "fresh_samples": 1,
+      "fresh_fraction": 1.0,
+      "median_spread_percent": 0.009302758267831168,
+      "min_two_sided_depth_usdt": 4299345.224700001,
+      "buy_fill_fraction": 1.0,
+      "sell_fill_fraction": 1.0,
+      "median_buy_slippage_percent": 2.220446049250313e-14,
+      "median_sell_slippage_percent": 0.0,
+      "observed_return_std": null,
+      "funding": {
+        "fundingRate": -1.024e-05,
+        "fundingTimestamp": 1791504000000,
+        "nextFundingTimestamp": null,
+        "interval": null,
+        "source": "projection_not_settled_cashflow"
+      },
+      "contract_limits": {
+        "leverage": {
+          "min": null,
+          "max": null
+        },
+        "amount": {
+          "min": 0.01,
+          "max": 1000000.0
+        },
+        "price": {
+          "min": 0.42,
+          "max": 6857.0
+        },
+        "cost": {
+          "min": 5.0,
+          "max": null
+        },
+        "market": {
+          "min": 0.01,
+          "max": 80000.0
+        }
+      },
+      "contract_precision": {
+        "amount": 0.01,
+        "price": 0.01,
+        "cost": null,
+        "base": 1e-08,
+        "quote": 1e-08
+      }
+    },
+    {
+      "exchange": "binance",
+      "symbol": "VELVET/USDT",
+      "samples": 1,
+      "fresh_samples": 1,
+      "fresh_fraction": 1.0,
+      "median_spread_percent": 0.028417163967025073,
+      "min_two_sided_depth_usdt": 4996.777170000001,
+      "buy_fill_fraction": 1.0,
+      "sell_fill_fraction": 1.0,
+      "median_buy_slippage_percent": 0.0,
+      "median_sell_slippage_percent": 0.012077461986648164,
+      "observed_return_std": null,
+      "funding": {
+        "fundingRate": 0.00010935,
+        "fundingTimestamp": 1791489600000,
+        "nextFundingTimestamp": null,
+        "interval": null,
+        "source": "projection_not_settled_cashflow"
+      },
+      "contract_limits": {
+        "leverage": {
+          "min": null,
+          "max": null
+        },
+        "amount": {
+          "min": 1.0,
+          "max": 3300000.0
+        },
+        "price": {
+          "min": 1e-05,
+          "max": 200.0
+        },
+        "cost": {
+          "min": 5.0,
+          "max": null
+        },
+        "market": {
+          "min": 1.0,
+          "max": 1100000.0
+        }
+      },
+      "contract_precision": {
+        "amount": 1.0,
+        "price": 1e-05,
+        "cost": null,
+        "base": 1e-08,
+        "quote": 1e-08
+      }
+    },
+    {
+      "exchange": "binance",
+      "symbol": "XRP/USDT",
+      "samples": 1,
+      "fresh_samples": 1,
+      "fresh_fraction": 1.0,
+      "median_spread_percent": 0.0074663082838682185,
+      "min_two_sided_depth_usdt": 1440591.01222,
+      "buy_fill_fraction": 1.0,
+      "sell_fill_fraction": 1.0,
+      "median_buy_slippage_percent": 0.0,
+      "median_sell_slippage_percent": 0.0,
+      "observed_return_std": null,
+      "funding": {
+        "fundingRate": -3.912e-05,
+        "fundingTimestamp": 1791504000000,
+        "nextFundingTimestamp": null,
+        "interval": null,
+        "source": "projection_not_settled_cashflow"
+      },
+      "contract_limits": {
+        "leverage": {
+          "min": null,
+          "max": null
+        },
+        "amount": {
+          "min": 0.1,
+          "max": 10000000.0
+        },
+        "price": {
+          "min": 0.0143,
+          "max": 100000.0
+        },
+        "cost": {
+          "min": 5.0,
+          "max": null
+        },
+        "market": {
+          "min": 0.1,
+          "max": 2000000.0
+        }
+      },
+      "contract_precision": {
+        "amount": 0.1,
+        "price": 0.0001,
+        "cost": null,
+        "base": 1e-08,
+        "quote": 1e-08
+      }
+    },
+    {
+      "exchange": "bybit",
+      "symbol": "BTC/USDT",
+      "samples": 1,
+      "fresh_samples": 1,
+      "fresh_fraction": 1.0,
+      "median_spread_percent": 0.0001237076417374995,
+      "min_two_sided_depth_usdt": 384699.1281999999,
+      "buy_fill_fraction": 1.0,
+      "sell_fill_fraction": 1.0,
+      "median_buy_slippage_percent": 0.0,
+      "median_sell_slippage_percent": 0.0,
+      "observed_return_std": null,
+      "funding": {
+        "fundingRate": 1.898e-05,
+        "fundingTimestamp": 1791504000000,
+        "nextFundingTimestamp": null,
+        "interval": "8h",
+        "source": "projection_not_settled_cashflow"
+      },
+      "contract_limits": {
+        "leverage": {
+          "min": 1.0,
+          "max": 150.0
+        },
+        "amount": {
+          "min": 0.001,
+          "max": 1500.0
+        },
+        "price": {
+          "min": 0.1,
+          "max": 1999999.8
+        },
+        "cost": {
+          "min": null,
+          "max": null
+        }
+      },
+      "contract_precision": {
+        "amount": 0.001,
+        "price": 0.1,
+        "cost": null,
+        "base": null,
+        "quote": null
+      }
+    },
+    {
+      "exchange": "bybit",
+      "symbol": "ETH/USDT",
+      "samples": 1,
+      "fresh_samples": 1,
+      "fresh_fraction": 1.0,
+      "median_spread_percent": 0.0004125625290173082,
+      "min_two_sided_depth_usdt": 284560.3318,
+      "buy_fill_fraction": 1.0,
+      "sell_fill_fraction": 1.0,
+      "median_buy_slippage_percent": 0.0,
+      "median_sell_slippage_percent": 0.0,
+      "observed_return_std": null,
+      "funding": {
+        "fundingRate": 6.493e-05,
+        "fundingTimestamp": 1791504000000,
+        "nextFundingTimestamp": null,
+        "interval": "8h",
+        "source": "projection_not_settled_cashflow"
+      },
+      "contract_limits": {
+        "leverage": {
+          "min": 1.0,
+          "max": 150.0
+        },
+        "amount": {
+          "min": 0.01,
+          "max": 10000.0
+        },
+        "price": {
+          "min": 0.01,
+          "max": 199999.98
+        },
+        "cost": {
+          "min": null,
+          "max": null
+        }
+      },
+      "contract_precision": {
+        "amount": 0.01,
+        "price": 0.01,
+        "cost": null,
+        "base": null,
+        "quote": null
+      }
+    },
+    {
+      "exchange": "bybit",
+      "symbol": "SOL/USDT",
+      "samples": 1,
+      "fresh_samples": 1,
+      "fresh_fraction": 1.0,
+      "median_spread_percent": 0.009301892935217075,
+      "min_two_sided_depth_usdt": 6527962.642,
+      "buy_fill_fraction": 1.0,
+      "sell_fill_fraction": 1.0,
+      "median_buy_slippage_percent": 0.0,
+      "median_sell_slippage_percent": 0.0,
+      "observed_return_std": null,
+      "funding": {
+        "fundingRate": -9.31e-05,
+        "fundingTimestamp": 1791504000000,
+        "nextFundingTimestamp": null,
+        "interval": "8h",
+        "source": "projection_not_settled_cashflow"
+      },
+      "contract_limits": {
+        "leverage": {
+          "min": 1.0,
+          "max": 100.0
+        },
+        "amount": {
+          "min": 0.1,
+          "max": 96000.0
+        },
+        "price": {
+          "min": 0.01,
+          "max": 199999.98
+        },
+        "cost": {
+          "min": null,
+          "max": null
+        }
+      },
+      "contract_precision": {
+        "amount": 0.1,
+        "price": 0.01,
+        "cost": null,
+        "base": null,
+        "quote": null
+      }
+    },
+    {
+      "exchange": "bybit",
+      "symbol": "VELVET/USDT",
+      "samples": 1,
+      "fresh_samples": 1,
+      "fresh_fraction": 1.0,
+      "median_spread_percent": 0.14214641080313128,
+      "min_two_sided_depth_usdt": 33527.027,
+      "buy_fill_fraction": 1.0,
+      "sell_fill_fraction": 1.0,
+      "median_buy_slippage_percent": 0.0,
+      "median_sell_slippage_percent": 0.0,
+      "observed_return_std": null,
+      "funding": {
+        "fundingRate": 5e-05,
+        "fundingTimestamp": 1791489600000,
+        "nextFundingTimestamp": null,
+        "interval": "4h",
+        "source": "projection_not_settled_cashflow"
+      },
+      "contract_limits": {
+        "leverage": {
+          "min": 1.0,
+          "max": 5.0
+        },
+        "amount": {
+          "min": 10.0,
+          "max": 44000.0
+        },
+        "price": {
+          "min": 0.0001,
+          "max": 1999.9998
+        },
+        "cost": {
+          "min": null,
+          "max": null
+        }
+      },
+      "contract_precision": {
+        "amount": 10.0,
+        "price": 0.0001,
+        "cost": null,
+        "base": null,
+        "quote": null
+      }
+    },
+    {
+      "exchange": "bybit",
+      "symbol": "XRP/USDT",
+      "samples": 1,
+      "fresh_samples": 1,
+      "fresh_fraction": 1.0,
+      "median_spread_percent": 0.0074663082838682185,
+      "min_two_sided_depth_usdt": 1735212.5935899997,
+      "buy_fill_fraction": 1.0,
+      "sell_fill_fraction": 1.0,
+      "median_buy_slippage_percent": 0.0,
+      "median_sell_slippage_percent": 0.0,
+      "observed_return_std": null,
+      "funding": {
+        "fundingRate": -0.00011565,
+        "fundingTimestamp": 1791504000000,
+        "nextFundingTimestamp": null,
+        "interval": "8h",
+        "source": "projection_not_settled_cashflow"
+      },
+      "contract_limits": {
+        "leverage": {
+          "min": 1.0,
+          "max": 100.0
+        },
+        "amount": {
+          "min": 0.1,
+          "max": 7500000.0
+        },
+        "price": {
+          "min": 0.0001,
+          "max": 1999.9998
+        },
+        "cost": {
+          "min": null,
+          "max": null
+        }
+      },
+      "contract_precision": {
+        "amount": 0.1,
+        "price": 0.0001,
+        "cost": null,
+        "base": null,
+        "quote": null
+      }
+    },
+    {
+      "exchange": "mexc",
+      "symbol": "BTC/USDT",
+      "samples": 1,
+      "fresh_samples": 1,
+      "fresh_fraction": 1.0,
+      "median_spread_percent": 0.00012373488811064963,
+      "min_two_sided_depth_usdt": 1372711.5816600004,
+      "buy_fill_fraction": 1.0,
+      "sell_fill_fraction": 1.0,
+      "median_buy_slippage_percent": 9.746971592061726e-05,
+      "median_sell_slippage_percent": 0.0,
+      "observed_return_std": null,
+      "funding": {
+        "fundingRate": 2.2e-05,
+        "fundingTimestamp": 1791504000000,
+        "nextFundingTimestamp": null,
+        "interval": "8h",
+        "source": "projection_not_settled_cashflow"
+      },
+      "contract_limits": {
+        "leverage": {
+          "min": 1.0,
+          "max": 500.0
+        },
+        "amount": {
+          "min": 1.0,
+          "max": 400000.0
+        },
+        "price": {
+          "min": null,
+          "max": null
+        },
+        "cost": {
+          "min": null,
+          "max": null
+        }
+      },
+      "contract_precision": {
+        "amount": 1.0,
+        "price": 0.1,
+        "cost": null,
+        "base": null,
+        "quote": null
+      }
+    },
+    {
+      "exchange": "mexc",
+      "symbol": "ETH/USDT",
+      "samples": 1,
+      "fresh_samples": 1,
+      "fresh_fraction": 1.0,
+      "median_spread_percent": 0.0004125999781224445,
+      "min_two_sided_depth_usdt": 1172194.2765000002,
+      "buy_fill_fraction": 1.0,
+      "sell_fill_fraction": 1.0,
+      "median_buy_slippage_percent": 0.0,
+      "median_sell_slippage_percent": 0.0,
+      "observed_return_std": null,
+      "funding": {
+        "fundingRate": 1.2e-05,
+        "fundingTimestamp": 1791504000000,
+        "nextFundingTimestamp": null,
+        "interval": "8h",
+        "source": "projection_not_settled_cashflow"
+      },
+      "contract_limits": {
+        "leverage": {
+          "min": 1.0,
+          "max": 500.0
+        },
+        "amount": {
+          "min": 1.0,
+          "max": 70000.0
+        },
+        "price": {
+          "min": null,
+          "max": null
+        },
+        "cost": {
+          "min": null,
+          "max": null
+        }
+      },
+      "contract_precision": {
+        "amount": 1.0,
+        "price": 0.01,
+        "cost": null,
+        "base": null,
+        "quote": null
+      }
+    },
+    {
+      "exchange": "mexc",
+      "symbol": "SOL/USDT",
+      "samples": 1,
+      "fresh_samples": 1,
+      "fresh_fraction": 1.0,
+      "median_spread_percent": 0.018602920658539693,
+      "min_two_sided_depth_usdt": 8495746.082999999,
+      "buy_fill_fraction": 1.0,
+      "sell_fill_fraction": 1.0,
+      "median_buy_slippage_percent": 2.220446049250313e-14,
+      "median_sell_slippage_percent": 0.0,
+      "observed_return_std": null,
+      "funding": {
+        "fundingRate": -9e-06,
+        "fundingTimestamp": 1791504000000,
+        "nextFundingTimestamp": null,
+        "interval": "8h",
+        "source": "projection_not_settled_cashflow"
+      },
+      "contract_limits": {
+        "leverage": {
+          "min": 1.0,
+          "max": 300.0
+        },
+        "amount": {
+          "min": 1.0,
+          "max": 1600000.0
+        },
+        "price": {
+          "min": null,
+          "max": null
+        },
+        "cost": {
+          "min": null,
+          "max": null
+        }
+      },
+      "contract_precision": {
+        "amount": 1.0,
+        "price": 0.01,
+        "cost": null,
+        "base": null,
+        "quote": null
+      }
+    },
+    {
+      "exchange": "mexc",
+      "symbol": "VELVET/USDT",
+      "samples": 1,
+      "fresh_samples": 1,
+      "fresh_fraction": 1.0,
+      "median_spread_percent": 0.028417163967025073,
+      "min_two_sided_depth_usdt": 8028.4391,
+      "buy_fill_fraction": 1.0,
+      "sell_fill_fraction": 1.0,
+      "median_buy_slippage_percent": 0.0,
+      "median_sell_slippage_percent": 0.0,
+      "observed_return_std": null,
+      "funding": {
+        "fundingRate": 0.000117,
+        "fundingTimestamp": 1791489600000,
+        "nextFundingTimestamp": null,
+        "interval": "4h",
+        "source": "projection_not_settled_cashflow"
+      },
+      "contract_limits": {
+        "leverage": {
+          "min": 1.0,
+          "max": 50.0
+        },
+        "amount": {
+          "min": 1.0,
+          "max": 3000.0
+        },
+        "price": {
+          "min": null,
+          "max": null
+        },
+        "cost": {
+          "min": null,
+          "max": null
+        }
+      },
+      "contract_precision": {
+        "amount": 1.0,
+        "price": 1e-05,
+        "cost": null,
+        "base": null,
+        "quote": null
+      }
+    },
+    {
+      "exchange": "mexc",
+      "symbol": "XRP/USDT",
+      "samples": 1,
+      "fresh_samples": 1,
+      "fresh_fraction": 1.0,
+      "median_spread_percent": 0.007467423365566888,
+      "min_two_sided_depth_usdt": 2594619.9,
+      "buy_fill_fraction": 1.0,
+      "sell_fill_fraction": 1.0,
+      "median_buy_slippage_percent": 0.0,
+      "median_sell_slippage_percent": 0.0,
+      "observed_return_std": null,
+      "funding": {
+        "fundingRate": -3.8e-05,
+        "fundingTimestamp": 1791504000000,
+        "nextFundingTimestamp": null,
+        "interval": "8h",
+        "source": "projection_not_settled_cashflow"
+      },
+      "contract_limits": {
+        "leverage": {
+          "min": 1.0,
+          "max": 300.0
+        },
+        "amount": {
+          "min": 1.0,
+          "max": 840000.0
+        },
+        "price": {
+          "min": null,
+          "max": null
+        },
+        "cost": {
+          "min": null,
+          "max": null
+        }
+      },
+      "contract_precision": {
+        "amount": 1.0,
+        "price": 0.0001,
+        "cost": null,
+        "base": null,
+        "quote": null
+      }
+    }
+  ],
+  "cross_exchange_quality": {
+    "BTC/USDT": {
+      "median_fresh_exchanges": 2,
+      "minimum_fresh_exchanges": 1,
+      "median_price_dispersion_percent": 0.012125761367013923
+    },
+    "ETH/USDT": {
+      "median_fresh_exchanges": 2,
+      "minimum_fresh_exchanges": 1,
+      "median_price_dispersion_percent": 0.004538599759459467
+    },
+    "SOL/USDT": {
+      "median_fresh_exchanges": 2,
+      "minimum_fresh_exchanges": 1,
+      "median_price_dispersion_percent": 0.013953001641351433
+    },
+    "XRP/USDT": {
+      "median_fresh_exchanges": 2,
+      "minimum_fresh_exchanges": 1,
+      "median_price_dispersion_percent": 0.0074663082838682185
+    },
+    "VELVET/USDT": {
+      "median_fresh_exchanges": 2,
+      "minimum_fresh_exchanges": 1,
+      "median_price_dispersion_percent": 0.04263028930442117
+    }
+  },
+  "limitations": [
+    "Short sample is liquidity diagnostics, not a profitability test.",
+    "Returns are irregularly sampled; observed_return_std is not annualized volatility.",
+    "Funding is a point-in-time rate, not a historical funding cost series.",
+    "Depth fill is continuous base quantity; exchange lot/min-notional feasibility requires the contract limits and precision.",
+    "Missing timestamps, blocked APIs and unavailable markets are not replaced with spot data."
+  ],
+  "missing_markets": [],
+  "summary_scope": "last_at_most_5000_rows_of_this_collection_session",
+  "funding_file": "research/research-v1-stop-smoke.funding.jsonl",
+  "collection_active_seconds": 7.2553817089647055,
+  "missing_data": [
+    "Account-specific fees are estimates, not private fee tiers.",
+    "Historical funding mark price may be unavailable.",
+    "REST snapshots do not observe all book events or queue priority."
+  ]
+}

@@ -75,6 +75,13 @@ class OrderBookPatternStrategyConfig(Model, db.Model):
     adaptive_min_valid_exchanges_boost = db.Column(db.Integer, default=1, nullable=False)
     signal_diagnostics_max_rows = db.Column(db.Integer, default=100, nullable=False)
     paper_equity_usdt = db.Column(db.Float, default=10000, nullable=False)
+    risk_per_trade_percent = db.Column(db.Float, default=0.25, nullable=False)
+    max_position_margin_usdt = db.Column(db.Float, default=10, nullable=False)
+    emergency_entry_block = db.Column(db.Boolean, default=True, nullable=False)
+    paper_taker_fee_percent = db.Column(db.Float, default=0.1, nullable=False)
+    paper_latency_ms = db.Column(db.Integer, default=250, nullable=False)
+    max_consecutive_losses = db.Column(db.Integer, default=3, nullable=False)
+    max_leverage = db.Column(db.Float, default=2, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -202,6 +209,38 @@ class StrategyRunTrade(Model, db.Model):
     exit_price_warning = db.Column(db.Text, nullable=True)
     pnl_source = db.Column(db.String(40), nullable=True)
     holding_seconds = db.Column(db.Float, nullable=True)
+    execution_config_json = db.Column(db.Text, nullable=True)
+    live_client_order_id = db.Column(db.String(80), nullable=True)
+    live_close_client_order_id = db.Column(db.String(80), nullable=True)
+    paper_close_requested_at = db.Column(db.DateTime, nullable=True)
+    paper_close_reason = db.Column(db.String(80), nullable=True)
+    protection_status = db.Column(db.String(40), nullable=True)
+    protection_checked_at = db.Column(db.DateTime, nullable=True)
+    protection_expires_at = db.Column(db.DateTime, nullable=True)
+    legacy_reconciliation_status = db.Column(db.String(80), nullable=True)
+    funding_pnl = db.Column(db.Float, nullable=True)
+    funding_status = db.Column(db.String(40), nullable=True, index=True)
+    funding_checked_at = db.Column(db.DateTime, nullable=True)
+
+
+class TradeFundingEvent(db.Model):
+    __tablename__ = "orderbook_trade_funding_event"
+    id = db.Column(db.Integer, primary_key=True)
+    trade_id = db.Column(db.Integer, db.ForeignKey("strategy_run_trade.id", ondelete="CASCADE"), nullable=False, index=True)
+    exchange_event_id = db.Column(db.String(120), nullable=False)
+    settled_at = db.Column(db.DateTime, nullable=False)
+    amount_usdt = db.Column(db.Float, nullable=False)
+    __table_args__ = (db.UniqueConstraint("trade_id", "exchange_event_id"),)
+
+
+class ExecutionSlot(db.Model):
+    __tablename__ = "orderbook_execution_slot"
+
+    strategy_config_id = db.Column(db.Integer, db.ForeignKey("order_book_pattern_strategy_config.id"), primary_key=True)
+    trade_id = db.Column(db.Integer, db.ForeignKey("strategy_run_trade.id"), nullable=True)
+    client_order_id = db.Column(db.String(80), nullable=False, unique=True)
+    status = db.Column(db.String(40), nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
 class MLFeatureSnapshot(Model, db.Model):

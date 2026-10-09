@@ -233,19 +233,6 @@ class ScannerService:
                     "fetch_latency_ms": latency_ms,
                 })
                 self.arbitrage_strategy_service.run_once(ignore_enabled=False)
-                self.order_book_recovery_service.on_order_book_snapshot(
-                    exchange.title,
-                    trading_pair.pair,
-                    metadata={
-                        "exchange_id": exchange.id,
-                        "exchange_title": exchange.title,
-                        "exchange_slug": getattr(exchange, "slug", None) or exchange.title,
-                        "raw_pair": trading_pair.pair,
-                        "normalized_symbol": self.order_book_recovery_service.normalize_symbol(trading_pair.pair),
-                        "snapshot_timestamp": snapshot_ts,
-                        "fetch_latency_ms": latency_ms,
-                    },
-                )
                 await self._mark_exchange_recovered(exchange, "order_book")
             except Exception as error:
                 latency_ms = round((time.perf_counter() - started_at) * 1000, 2)
@@ -275,14 +262,85 @@ class ScannerService:
             self._order_book_inflight.discard(key)
             db.session.remove()
 
+    async def fetch_futures_snapshot(self, exchange, trading_pair):
+        from src import app
+        from src.OrderBookRecovery.FuturesSnapshotStore import FuturesSnapshotStore
+        # A separate public client prevents spot/swap settings and rate state races.
+        cache = getattr(self, "_futures_clients", None)
+        if cache is None:
+            cache = self._futures_clients = {}
+        client = cache.get(exchange.id)
+        if client is None:
+            client = ExchangeGetter.get_exchange(exchange.title, "", "", password="")
+            if not client:
+                return
+            client.exchange.options.update(defaultType="swap", defaultSubType="linear")
+            client.exchange.timeout = int(self.order_book_fetch_timeout_seconds * 1000)
+            if str(exchange.title).strip().lower() == "mexc":
+                client.exchange.urls["api"]["contract"]["public"] = "https://api.mexc.com/api/v1/contract"
+            cache[exchange.id] = client
+        try:
+            workers = getattr(self, "_futures_workers", None)
+            if workers is None:
+                workers = self._futures_workers = {}
+            previous = workers.get(exchange.id)
+            if previous and not previous.done():
+                return
+            if previous:
+                try:
+                    previous.result()
+                except Exception:
+                    pass
+            started = time.perf_counter()
+            worker = asyncio.create_task(asyncio.to_thread(client.get_futures_order_book, trading_pair.pair, max(20, trading_pair.order_limit)))
+            workers[exchange.id] = worker
+            book, metadata = await asyncio.wait_for(
+                asyncio.shield(worker),
+                timeout=self.order_book_fetch_timeout_seconds,
+            )
+            metadata.update(exchange_id=exchange.id, exchange_title=exchange.title, raw_pair=trading_pair.pair,
+                            fetch_latency_ms=(time.perf_counter() - started) * 1000)
+            FuturesSnapshotStore.update(exchange.title, trading_pair.pair, book, metadata)
+            lock = getattr(self, "_recovery_evaluation_lock", None)
+            if lock is None:
+                lock = self._recovery_evaluation_lock = asyncio.Lock()
+            if lock.locked():
+                return
+            def evaluate():
+                with app.app_context():
+                    try:
+                        self.order_book_recovery_service.on_order_book_snapshot(exchange.title, trading_pair.pair, metadata)
+                    finally:
+                        db.session.remove()
+            async with lock:
+                await asyncio.to_thread(evaluate)
+        except Exception as error:
+            logger.warning("Futures snapshot rejected exchange=%s pair=%s reason=%s", exchange.title, trading_pair.pair, type(error).__name__)
+
     async def order_scanner(self):
         async def cycle():
             now = time.time()
+            task = getattr(self, "_reconciliation_task", None)
+            if (not task or task.done()) and now >= getattr(self, "_next_reconciliation_at", 0):
+                self._next_reconciliation_at = now + 5
+                self._reconciliation_task = asyncio.create_task(self._reconcile_positions())
+            configured_symbol = self.order_book_recovery_service.get_or_create_config().symbol
             exchanges = self.exchange_repository.get_all(enabled=True)
             for exchange in exchanges:
                 trading_pairs = self.trading_pair_repository.get_all(exchange_id=exchange.id, enabled=True)
                 for trading_pair in trading_pairs:
                     key = self._pair_key(exchange, trading_pair)
+                    futures_inflight = getattr(self, "_futures_inflight", None)
+                    if futures_inflight is None:
+                        futures_inflight = self._futures_inflight = set()
+                    futures_due = getattr(self, "_futures_due", None)
+                    if futures_due is None:
+                        futures_due = self._futures_due = {}
+                    symbol_matches = self.order_book_recovery_service.normalize_symbol(trading_pair.pair) == self.order_book_recovery_service.normalize_symbol(configured_symbol)
+                    if symbol_matches and key not in futures_inflight and futures_due.get(key, 0) <= now:
+                        futures_inflight.add(key)
+                        futures_due[key] = now + self.fast_order_book_interval_seconds
+                        asyncio.create_task(self._run_futures_task(exchange, trading_pair))
                     next_scan_at = self._next_order_book_scan_at.get(key, 0)
                     if key in self._order_book_inflight or next_scan_at > now:
                         continue
@@ -291,6 +349,25 @@ class ScannerService:
                     asyncio.create_task(self._run_order_book_task(exchange, trading_pair))
 
         await self.run_scanner_cycle("order_scanner", self.order_scan_interval, cycle)
+
+    async def _run_futures_task(self, exchange, trading_pair):
+        try:
+            await self.fetch_futures_snapshot(exchange, trading_pair)
+        finally:
+            self._futures_inflight.discard(self._pair_key(exchange, trading_pair))
+
+    async def _reconcile_positions(self):
+        from src import app
+        def reconcile():
+            with app.app_context():
+                try:
+                    self.order_book_recovery_service.reconcile_existing_positions()
+                finally:
+                    db.session.remove()
+        try:
+            await asyncio.to_thread(reconcile)
+        except Exception:
+            logger.exception("Periodic position reconciliation failed")
 
     async def fetch_balance(self, exchange, pair, symbol):
         async with self._semaphore:

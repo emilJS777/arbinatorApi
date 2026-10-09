@@ -1,0 +1,211 @@
+{
+  "pairs": {
+    "BTC/USDT": {
+      "configured_ticks": 12,
+      "configured_fresh_ticks": 12,
+      "cross_exchange_covered_ticks": 12,
+      "configured_fresh_fraction": 1.0,
+      "cross_exchange_coverage_fraction": 1.0,
+      "max_configured_gap_seconds": 339.18,
+      "observed_duration_days": 0.007102280092592592
+    },
+    "ETH/USDT": {
+      "configured_ticks": 12,
+      "configured_fresh_ticks": 12,
+      "cross_exchange_covered_ticks": 12,
+      "configured_fresh_fraction": 1.0,
+      "cross_exchange_coverage_fraction": 1.0,
+      "max_configured_gap_seconds": 339.901,
+      "observed_duration_days": 0.00709400462962963
+    },
+    "SOL/USDT": {
+      "configured_ticks": 12,
+      "configured_fresh_ticks": 12,
+      "cross_exchange_covered_ticks": 12,
+      "configured_fresh_fraction": 1.0,
+      "cross_exchange_coverage_fraction": 1.0,
+      "max_configured_gap_seconds": 340.066,
+      "observed_duration_days": 0.007085844907407407
+    },
+    "XRP/USDT": {
+      "configured_ticks": 12,
+      "configured_fresh_ticks": 12,
+      "cross_exchange_covered_ticks": 12,
+      "configured_fresh_fraction": 1.0,
+      "cross_exchange_coverage_fraction": 1.0,
+      "max_configured_gap_seconds": 340.901,
+      "observed_duration_days": 0.007075219907407408
+    },
+    "VELVET/USDT": {
+      "configured_ticks": 12,
+      "configured_fresh_ticks": 12,
+      "cross_exchange_covered_ticks": 12,
+      "configured_fresh_fraction": 1.0,
+      "cross_exchange_coverage_fraction": 1.0,
+      "max_configured_gap_seconds": 341.688,
+      "observed_duration_days": 0.007066238425925926
+    }
+  },
+  "venues": {
+    "bybit:BTC/USDT": {
+      "rows": 12,
+      "valid_identity_contract_depth": 12,
+      "fresh": 12,
+      "below_contract_min_amount": 12,
+      "depth_unit_provenance_missing": 8,
+      "explicit_min_notional_not_published": 12,
+      "depth_conversion_verified": 2,
+      "max_gap_seconds": 339.202
+    },
+    "binance:BTC/USDT": {
+      "rows": 12,
+      "valid_identity_contract_depth": 12,
+      "fresh": 12,
+      "below_contract_min_amount": 12,
+      "depth_unit_provenance_missing": 8,
+      "depth_conversion_verified": 2,
+      "max_gap_seconds": 339.188
+    },
+    "mexc:BTC/USDT": {
+      "rows": 12,
+      "valid_identity_contract_depth": 12,
+      "fresh": 12,
+      "executable_two_sided_size": 12,
+      "depth_unit_provenance_missing": 8,
+      "explicit_min_notional_not_published": 12,
+      "depth_conversion_verified": 2,
+      "max_gap_seconds": 339.18
+    },
+    "bybit:ETH/USDT": {
+      "rows": 12,
+      "valid_identity_contract_depth": 12,
+      "fresh": 12,
+      "below_contract_min_amount": 12,
+      "depth_unit_provenance_missing": 8,
+      "explicit_min_notional_not_published": 12,
+      "depth_conversion_verified": 2,
+      "max_gap_seconds": 339.653
+    },
+    "binance:ETH/USDT": {
+      "rows": 12,
+      "valid_identity_contract_depth": 12,
+      "fresh": 12,
+      "below_contract_min_notional": 12,
+      "depth_unit_provenance_missing": 8,
+      "depth_conversion_verified": 2,
+      "max_gap_seconds": 339.771
+    },
+    "mexc:ETH/USDT": {
+      "rows": 12,
+      "valid_identity_contract_depth": 12,
+      "fresh": 12,
+      "below_contract_min_amount": 12,
+      "depth_unit_provenance_missing": 8,
+      "explicit_min_notional_not_published": 12,
+      "depth_conversion_verified": 2,
+      "max_gap_seconds": 339.901
+    },
+    "bybit:SOL/USDT": {
+      "rows": 12,
+      "valid_identity_contract_depth": 12,
+      "fresh": 12,
+      "executable_two_sided_size": 12,
+      "depth_unit_provenance_missing": 8,
+      "explicit_min_notional_not_published": 12,
+      "depth_conversion_verified": 2,
+      "max_gap_seconds": 340.112
+    },
+    "binance:SOL/USDT": {
+      "rows": 12,
+      "valid_identity_contract_depth": 12,
+      "fresh": 12,
+      "executable_two_sided_size": 12,
+      "depth_unit_provenance_missing": 8,
+      "depth_conversion_verified": 2,
+      "max_gap_seconds": 340.355
+    },
+    "bybit:XRP/USDT": {
+      "rows": 12,
+      "valid_identity_contract_depth": 12,
+      "fresh": 12,
+      "executable_two_sided_size": 12,
+      "depth_unit_provenance_missing": 8,
+      "explicit_min_notional_not_published": 12,
+      "depth_conversion_verified": 2,
+      "max_gap_seconds": 340.574
+    },
+    "mexc:SOL/USDT": {
+      "rows": 12,
+      "valid_identity_contract_depth": 12,
+      "fresh": 12,
+      "executable_two_sided_size": 12,
+      "depth_unit_provenance_missing": 8,
+      "explicit_min_notional_not_published": 12,
+      "depth_conversion_verified": 2,
+      "max_gap_seconds": 340.066
+    },
+    "bybit:VELVET/USDT": {
+      "rows": 12,
+      "valid_identity_contract_depth": 12,
+      "fresh": 12,
+      "executable_two_sided_size": 12,
+      "depth_unit_provenance_missing": 8,
+      "explicit_min_notional_not_published": 12,
+      "depth_conversion_verified": 2,
+      "max_gap_seconds": 341.036
+    },
+    "binance:XRP/USDT": {
+      "rows": 12,
+      "valid_identity_contract_depth": 12,
+      "fresh": 12,
+      "executable_two_sided_size": 12,
+      "depth_unit_provenance_missing": 8,
+      "depth_conversion_verified": 2,
+      "max_gap_seconds": 340.935
+    },
+    "mexc:XRP/USDT": {
+      "rows": 12,
+      "valid_identity_contract_depth": 12,
+      "fresh": 12,
+      "executable_two_sided_size": 12,
+      "depth_unit_provenance_missing": 8,
+      "explicit_min_notional_not_published": 12,
+      "depth_conversion_verified": 2,
+      "max_gap_seconds": 340.901
+    },
+    "binance:VELVET/USDT": {
+      "rows": 12,
+      "valid_identity_contract_depth": 12,
+      "fresh": 12,
+      "executable_two_sided_size": 12,
+      "depth_unit_provenance_missing": 8,
+      "depth_conversion_verified": 2,
+      "max_gap_seconds": 341.489
+    },
+    "mexc:VELVET/USDT": {
+      "rows": 12,
+      "valid_identity_contract_depth": 12,
+      "fresh": 12,
+      "executable_two_sided_size": 12,
+      "depth_unit_provenance_missing": 8,
+      "explicit_min_notional_not_published": 12,
+      "depth_conversion_verified": 2,
+      "max_gap_seconds": 341.688
+    }
+  },
+  "rejections": {},
+  "first_received_at": 1791479008467,
+  "last_received_at": 1791479623888,
+  "duration_seconds": 615.421,
+  "fee_status": "account_tier_unknown_public_metadata_not_verified_fees",
+  "funding": {
+    "rows": 84,
+    "errors": 0,
+    "settled_rate_without_mark": 84
+  },
+  "book_bytes": 285745,
+  "estimated_book_bytes_per_day": 40116226.128130175,
+  "estimated_continuous_book_bytes_per_day": 543929106.3154998,
+  "disk_estimate_method": "median per venue/pair interval <=30s; resume idle gaps excluded; average observed JSONL row size",
+  "disk_estimate_warning": "short_sample_extrapolation_only_allow_3x_plus_replay_index_and_funding"
+}

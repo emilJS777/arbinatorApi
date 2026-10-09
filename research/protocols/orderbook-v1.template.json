@@ -1,0 +1,72 @@
+{
+  "protocol_version": "orderbook-recovery-research-v1.1",
+  "strategy": "OrderBookRecovery; unchanged signal rules; bounded risk; paper replay only",
+  "candidate_pairs": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "VELVET/USDT"],
+  "venues": ["mexc", "binance", "bybit"],
+  "execution_venue": "mexc",
+  "chronology": {
+    "timezone": "UTC; naive ISO values below are explicitly UTC",
+    "development_start_utc": "2026-10-09T00:00:00",
+    "development_end_utc": "2026-10-23T00:00:00",
+    "evaluation_start_utc": "2026-10-24T00:00:00",
+    "evaluation_end_utc": "2026-11-21T00:00:00",
+    "purge_gap_seconds": 86400,
+    "rule": "No evaluation inspection/tuning/pair selection. Any development change requires new plan version and seal before evaluation collection."
+  },
+  "parameters": {
+    "exchange": "mexc",
+    "symbol": "BTC/USDT",
+    "execution_mode": "paper",
+    "paper_mode_only": true,
+    "live_enabled_confirmation": false,
+    "live_kill_switch": true,
+    "ml_mode": "disabled",
+    "base_margin_usdt": 10,
+    "max_position_margin_usdt": 10,
+    "leverage": 2,
+    "max_leverage": 2,
+    "paper_equity_usdt": 10000,
+    "risk_per_trade_percent": 0.25,
+    "max_open_positions": 1,
+    "max_daily_loss_usdt": 25,
+    "max_total_loss_usdt": 100,
+    "paper_taker_fee_percent": 0.1,
+    "paper_latency_ms": 250
+  },
+  "position_policy": {
+    "max_notional_usdt": 20,
+    "requested_margin_usdt": 10,
+    "no_geometric_loss_increase": true,
+    "never_round_up_to_exchange_minimum": true,
+    "independent_virtual_account_per_pair": true,
+    "not_a_combined_portfolio": true
+  },
+  "fee_assumptions": {
+    "exact_account_tiers": "unavailable; public taker metadata is not account verification",
+    "primary_percent_per_side": 0.1,
+    "funding": "primary uses settled public rates plus settlement mark only where available; missing is explicit, not zero evidence",
+    "scenarios_are_not_fee_quotes_or_worst_case_bounds": true
+  },
+  "cost_scenarios": [
+    {"name": "conservative_assumption", "taker_fee_percent_per_side": 0.1, "latency_ms": 250, "adverse_funding_percent_per_8h": 0.1},
+    {"name": "fee_latency_stress", "taker_fee_percent_per_side": 0.15, "latency_ms": 1000, "adverse_funding_percent_per_8h": 0.1},
+    {"name": "high_cost_stress", "taker_fee_percent_per_side": 0.2, "latency_ms": 2000, "adverse_funding_percent_per_8h": 0.3}
+  ],
+  "data_quality_requirements": {
+    "min_configured_fresh_fraction": 0.95,
+    "min_cross_exchange_coverage_fraction": 0.9,
+    "max_configured_gap_seconds": 30,
+    "min_observed_evaluation_days": 27.5,
+    "min_closed_trades_per_pair": 100,
+    "futures_identity": "active linear USDT settled perpetual; no spot substitutes",
+    "required_metadata": ["resolved_symbol", "contract_size", "limits", "precision", "precision_mode", "timestamp", "received_at"],
+    "depth_unit": "base asset after exactly one contracts * contractSize conversion",
+    "incompatible_or_stale_sources": "excluded, not forward filled beyond frozen freshness window",
+    "missing_fees_funding_marks": "disclosed; primary exact-cost verdict inconclusive; assumptions tested separately"
+  },
+  "evaluation_metrics": ["signal_funnel_and_exact_rejections", "closed_trade_count", "net_pnl", "realized_and_mark_to_market_drawdown", "exposure_seconds_and_fraction", "notional_time", "cost_sensitivity", "open_positions_at_boundary", "data_quality_and_missing_inputs"],
+  "baseline": "raw-price momentum comparator only, identical realistic cost assumptions; not complete historic production reconstruction",
+  "selection_policy": "No automatic winning pair. Development only may inform a new pre-evaluation protocol version; evaluation is confirmatory reporting of all predeclared pairs, never selection/tuning.",
+  "insufficient_evidence_verdict": "inconclusive",
+  "statistics_policy": "100 trades is a screening minimum, not significance. Before any edge claim: confidence intervals/dependence-aware bootstrap, multiple-comparison handling, regime and cost sensitivity review."
+}

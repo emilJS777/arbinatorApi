@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import csv
 import io
@@ -10,12 +10,29 @@ import subprocess
 import sys
 
 from src import db
-from src.Arbitrage.OrderBookSnapshotStore import OrderBookSnapshotStore
+from src.OrderBookRecovery.FuturesSnapshotStore import FuturesSnapshotStore
 from src.Exchange.ExchangeModel import Exchange
 from src.OrderBookRecovery.LiveExecutionService import LiveExecutionService
-from src.OrderBookRecovery.OrderBookRecoveryModel import MLFeatureSnapshot, MLMarketPriceHistory, MLMarketSnapshot, MLMarketSnapshotExchangeLabel, StrategyRunTrade
+from src.OrderBookRecovery.OrderBookRecoveryModel import MLFeatureSnapshot, MLMarketPriceHistory, MLMarketSnapshot, MLMarketSnapshotExchangeLabel, StrategyRunTrade, ExecutionSlot
 from src.OrderBookRecovery.OrderBookNormalizer import OrderBookNormalizer
 from src.OrderBookRecovery.OrderBookRecoveryService import OrderBookRecoveryService
+
+
+class OrderBookSnapshotStore(FuturesSnapshotStore):
+    @classmethod
+    def update(cls, exchange, symbol, order_book, metadata=None):
+        metadata = {"market_type": "swap", "linear": True, "settle": "USDT", "source_timestamp": datetime.utcnow(), **(metadata or {})}
+        FuturesSnapshotStore.update(exchange, symbol, order_book, metadata)
+        cls._snapshots = FuturesSnapshotStore._snapshots
+
+    @classmethod
+    def all(cls):
+        return FuturesSnapshotStore.all()
+
+    @classmethod
+    def clear(cls):
+        FuturesSnapshotStore.clear()
+        cls._snapshots = FuturesSnapshotStore._snapshots
 
 
 def make_config(service):
@@ -36,6 +53,9 @@ def make_config(service):
     config.cooldown_after_loss_seconds = 0
     config.cooldown_after_win_seconds = 0
     config.max_spread_percent = 0.05
+    config.emergency_entry_block = False
+    config.paper_latency_ms = 0
+    config.paper_taker_fee_percent = 0
     config.enabled = True
     db.session.commit()
     return config
@@ -43,7 +63,8 @@ def make_config(service):
 
 def open_trade(service, config, side="long", entry=100):
     state = service.get_or_create_state(config)
-    return service.open_position(
+    OrderBookSnapshotStore.update(config.exchange, config.symbol, {"bids": [[entry, 10000]], "asks": [[entry, 10000]]})
+    result = service.open_position(
         config,
         state,
         {
@@ -55,6 +76,9 @@ def open_trade(service, config, side="long", entry=100):
         side,
         datetime.utcnow(),
     )
+    trade = db.session.get(StrategyRunTrade, result["id"])
+    service.evaluate_open_trade(trade, entry, state, service.trade_config(config, trade), datetime.utcnow())
+    return service.trade_to_dict(trade)
 
 
 def closed_trade(config, pnl=1, result=None, closed_at=None, side="long", signal_valid_exchanges_count=None, signal_momentum=None):
@@ -106,7 +130,7 @@ class MockLiveClient:
         self.fail_close = fail_close
         self.fail_open = fail_open
         self.fail_contract_open = fail_contract_open
-        self.markets = markets or {"TON/USDT": {"symbol": "TON/USDT", "swap": True, "contract": True, "base": "TON", "quote": "USDT", "settle": "USDT", "linear": True}}
+        self.markets = markets or {"TON/USDT": {"id": "TON_USDT", "symbol": "TON/USDT", "contractSize": .001, "swap": True, "contract": True, "base": "TON", "quote": "USDT", "settle": "USDT", "linear": True}}
         self.positions = positions
 
     def load_markets(self):
@@ -121,11 +145,13 @@ class MockLiveClient:
     def price_to_precision(self, symbol, price):
         return price
 
-    def fetch_positions(self):
+    def fetch_balance(self, params=None):
+        return {"free": {"USDT": 10000}}
+
+    def fetch_positions(self, symbols=None):
         if self.positions is not None:
             return self.positions
-        symbol = next(iter(self.markets.keys()))
-        return [{"symbol": symbol, "contracts": 1}]
+        return []
 
     def sign(self, path, api=None, method="GET", params=None):
         body = json.dumps(params or {}, separators=(",", ":")) if method == "POST" else None
@@ -158,7 +184,8 @@ class MockLiveClient:
         if params.get("reduceOnly") and self.fail_close:
             raise Exception("close failed")
         if not params.get("reduceOnly") and self.fail_open:
-            raise Exception("open failed")
+            from src.OrderBookRecovery.LiveExecutionService import LiveExecutionError
+            raise LiveExecutionError("open failed")
         order = {
             "id": f"order-{len(self.orders) + 1}",
             "symbol": symbol,
@@ -198,6 +225,30 @@ class MockMexcSubmitRequests:
             "data": data,
             "timeout": timeout,
         })
+        if method == "POST" and "order/create" in url:
+            self.order_body = json.loads(data or "{}")
+        if method == "POST" and "planorder/place" in url:
+            plans = getattr(self, "plans", [])
+            plan = dict(json.loads(data), id=f"plan-{len(plans) + 1}", state=1, executeCycle=24,
+                        createTime=int(datetime.now(timezone.utc).timestamp() * 1000))
+            plans.append(plan)
+            self.plans = plans
+            return self.Response(200, json.dumps({"success": True, "code": 0, "data": plan["id"]}))
+        if method == "GET" and "planorder/list/orders" in url:
+            return self.Response(200, json.dumps({"success": True, "code": 0, "data": getattr(self, "plans", [])}))
+        if method == "GET" and "position/funding_records" in url:
+            return self.Response(200, json.dumps({"success": True, "code": 0, "data": {"resultList": []}}))
+        if method == "GET" and ("order/get/" in url or "order/external/" in url):
+            body = getattr(self, "order_body", {"vol": 140, "side": 1})
+            return self.Response(200, json.dumps({"success": True, "code": 0, "data": {
+                "orderId": "contract-order-1", "positionId": 123, "state": 3, "vol": body["vol"],
+                "dealVol": body["vol"], "dealAvgPrice": 100, "totalFee": .01, "feeCurrency": "USDT"}}))
+        if method == "GET" and "history_orders" in url:
+            body = getattr(self, "order_body", {"vol": 140})
+            return self.Response(200, json.dumps({"success": True, "code": 0, "data": [{
+                "orderId": "external-close", "positionId": 123, "state": 3, "vol": body["vol"],
+                "dealVol": body["vol"], "dealAvgPrice": 101, "totalFee": .01, "feeCurrency": "USDT",
+                "symbol": "BTC_USDT", "side": 4, "profit": .1, "createTime": int(datetime.utcnow().replace(tzinfo=timezone.utc).timestamp() * 1000) + 1000}]}))
         return self.Response(self.status_code, self.text)
 
     def get(self, url, params=None, timeout=None):
@@ -212,6 +263,8 @@ class MockMexcSubmitRequests:
 
 class FailingTpSlRequests(MockMexcSubmitRequests):
     def request(self, method, url, headers=None, data=None, timeout=None):
+        if method == "GET":
+            return super().request(method, url, headers, data, timeout)
         self.calls.append({
             "method": method,
             "url": url,
@@ -226,6 +279,8 @@ class FailingTpSlRequests(MockMexcSubmitRequests):
 
 class AlreadyClosedOnCloseRequests(MockMexcSubmitRequests):
     def request(self, method, url, headers=None, data=None, timeout=None):
+        if method == "GET":
+            return super().request(method, url, headers, data, timeout)
         body = json.loads(data or "{}")
         self.calls.append({
             "method": method,
@@ -247,7 +302,7 @@ def prime_momentum(service, config, exchange, symbol="TON/USDT", old_bid=99, old
             "bids": [[old_bid, 10]],
             "asks": [[old_ask, 5]],
         },
-        "updated_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow() - timedelta(seconds=1),
     }
     service.features(config, snapshot)
 
@@ -268,11 +323,8 @@ def test_take_profit_closes_by_margin_percent(client):
     open_trade(service, config, "long", 100)
     trade = StrategyRunTrade.query.first()
 
-    closed = service.evaluate(config, snapshot={
-        "exchange": "binance",
-        "symbol": "BTC/USDT",
-        "order_book": {"bids": [[105, 5]], "asks": [[105, 5]]},
-    })
+    OrderBookSnapshotStore.update(config.exchange, config.symbol, {"bids": [[105, 5]], "asks": [[105, 5]]})
+    closed = service.evaluate(config)
 
     assert closed["reason_close"] == "take_profit"
     assert trade.result == "win"
@@ -285,11 +337,8 @@ def test_stop_loss_closes_by_margin_percent(client):
     open_trade(service, config, "long", 100)
     trade = StrategyRunTrade.query.first()
 
-    closed = service.evaluate(config, snapshot={
-        "exchange": "binance",
-        "symbol": "BTC/USDT",
-        "order_book": {"bids": [[97.5, 5]], "asks": [[97.5, 5]]},
-    })
+    OrderBookSnapshotStore.update(config.exchange, config.symbol, {"bids": [[97.5, 5]], "asks": [[97.5, 5]]})
+    closed = service.evaluate(config)
 
     assert closed["reason_close"] == "stop_loss"
     assert trade.result == "loss"
@@ -353,7 +402,7 @@ def test_manual_close_win_resets_recovery(client):
     assert state.consecutive_losses == 0
 
 
-def test_manual_close_loss_increases_recovery_step(client):
+def test_manual_close_loss_keeps_bounded_margin(client):
     service = OrderBookRecoveryService()
     config = make_config(service)
     state = service.get_or_create_state(config)
@@ -368,8 +417,8 @@ def test_manual_close_loss_increases_recovery_step(client):
 
     assert trade.result == "loss"
     assert round(trade.pnl, 2) == -0.35
-    assert state.current_step == 1
-    assert state.current_margin == 14
+    assert state.current_step == 0
+    assert state.current_margin == config.base_margin_usdt
 
 
 def test_manual_close_without_valid_market_price_returns_error(client):
@@ -377,6 +426,7 @@ def test_manual_close_without_valid_market_price_returns_error(client):
     config = make_config(service)
     open_trade(service, config, "long", 100)
     trade = StrategyRunTrade.query.first()
+    OrderBookSnapshotStore.clear()
 
     response = client.post(f"/api/orderbook-recovery/positions/{trade.id}/close-manual", json={"reason": "manual_close"})
 
@@ -530,7 +580,7 @@ def test_delete_all_archived_trades(client):
     assert db.session.get(StrategyRunTrade, active.id) is not None
 
 
-def test_recovery_doubles_after_loss(client):
+def test_recovery_does_not_increase_after_loss(client):
     service = OrderBookRecoveryService()
     config = make_config(service)
     state = service.get_or_create_state(config)
@@ -538,11 +588,11 @@ def test_recovery_doubles_after_loss(client):
     service.apply_recovery_after_close(state, config, "loss")
     db.session.commit()
 
-    assert state.current_step == 1
-    assert state.current_margin == 14
+    assert state.current_step == 0
+    assert state.current_margin == config.base_margin_usdt
 
 
-def test_loss_on_step_one_moves_to_step_two(client):
+def test_second_loss_keeps_bounded_margin(client):
     service = OrderBookRecoveryService()
     config = make_config(service)
     state = service.get_or_create_state(config)
@@ -551,8 +601,8 @@ def test_loss_on_step_one_moves_to_step_two(client):
     service.apply_recovery_after_close(state, config, "loss")
     db.session.commit()
 
-    assert state.current_step == 2
-    assert state.current_margin == 28
+    assert state.current_step == 0
+    assert state.current_margin == config.base_margin_usdt
     assert state.is_stopped is False
 
 
@@ -934,7 +984,7 @@ def test_after_long_loss_strategy_can_open_short_when_signal_flips(client):
     second = service.evaluate(config)
 
     assert long_trade.result == "loss"
-    assert state.current_step == 1
+    assert state.current_step == 0
     assert second["side"] == "short"
 
 
@@ -1894,7 +1944,7 @@ def test_side_quality_filter_blocks_recent_net_negative_side(client):
 
 
 def test_live_close_uses_net_pnl_after_fees(client):
-    class FeeCloseService:
+    class FeeCloseService(LiveExecutionService):
         def close_position(self, config, trade, current_price):
             return {
                 "order_id": "close-1",
@@ -1927,8 +1977,11 @@ def test_live_close_uses_net_pnl_after_fees(client):
         execution_mode="live",
         live_status="open",
         opened_at=datetime.utcnow() - timedelta(minutes=1),
+        execution_config_json=json.dumps(service.config_to_dict(config), default=str),
     )
     db.session.add(trade)
+    db.session.commit()
+    db.session.add(ExecutionSlot(strategy_config_id=config.id, trade_id=trade.id, client_order_id="test-fee", status="active"))
     db.session.commit()
 
     closed = service.close_trade(trade, 110, 1, "take_profit", state, config, datetime.utcnow())
@@ -2733,7 +2786,7 @@ def test_manual_close_live_failed_does_not_mark_trade_closed(client):
 
     assert response.status_code == 400
     assert trade.closed_at is None
-    assert trade.live_status == "close_failed"
+    assert trade.live_status == "close_unknown"
 
 
 def test_manual_close_mexc_2009_reconciles_as_closed(client):
@@ -2776,10 +2829,9 @@ def test_manual_close_mexc_2009_reconciles_as_closed(client):
     assert trade.closed_at is not None
     assert trade.live_status == "closed"
     assert trade.reason_close == "exchange_position_already_closed"
-    assert trade.exit_price_fallback_used is True
-    assert trade.exit_price_warning == "position already closed on exchange; used latest market price"
-    assert trade.pnl_source == "fallback_market_price"
-    assert "position already closed" in trade.live_error
+    assert trade.exit_price_fallback_used is False
+    assert trade.pnl_source == "verified_fills_funding_pending"
+    assert trade.funding_status == "pending"
 
 
 def test_external_exchange_close_reconciliation_closes_local_trade(client):
@@ -2822,8 +2874,9 @@ def test_external_exchange_close_reconciliation_closes_local_trade(client):
     assert result["reason_close"] == "exchange_position_closed_external"
     assert trade.closed_at is not None
     assert trade.live_status == "closed"
-    assert trade.exit_price_fallback_used is True
-    assert trade.pnl_source == "fallback_market_price"
+    assert trade.exit_price_fallback_used is False
+    assert trade.pnl_source == "verified_fills_funding_pending"
+    assert trade.funding_status == "pending"
 
 
 def test_live_resolves_configured_symbol_to_swap_symbol(client):
@@ -2877,7 +2930,7 @@ def test_live_create_order_uses_resolved_futures_symbol(client):
     config.live_order_type = "market"
     db.session.commit()
 
-    service.open_position(config, "long", 7, 2, 100)
+    service.open_position(config, "long", 7, 2, 100, client_order_id="test-resolved")
 
     assert mock_client.orders[0]["symbol"] == "BTC/USDT:USDT"
 
@@ -2927,8 +2980,8 @@ def test_successful_mocked_mexc_futures_order_opens_trade(client):
     assert sent_body["symbol"] == "BTC_USDT"
     assert sent_body["side"] == 1
     assert sent_body["openType"] == 1
-    assert sent_body["type"] == 6
-    assert "price" not in sent_body
+    assert sent_body["type"] == 5
+    assert sent_body["price"] == 0
 
 
 def test_mexc_risk_control_code_has_clear_error(client):
@@ -2956,7 +3009,7 @@ def test_mexc_risk_control_code_has_clear_error(client):
     db.session.commit()
 
     try:
-        service.open_position(config, "long", 7, 2, 100)
+        service.open_position(config, "long", 7, 2, 100, client_order_id="test-risk-control")
     except Exception as error:
         assert str(error) == "mexc_risk_control_verification_required"
     else:
@@ -3032,8 +3085,8 @@ def test_mexc_tpsl_creation_success_stores_order_ids(client):
 
     assert result["tp_sl_protected"] is True
     assert trade.tp_sl_protected is True
-    assert trade.exchange_tp_order_id == "contract-order-1"
-    assert trade.exchange_sl_order_id == "contract-order-1"
+    assert trade.exchange_tp_order_id == "plan-2"
+    assert trade.exchange_sl_order_id == "plan-1"
     assert trade.exchange_tp_price is not None
     assert trade.exchange_sl_price is not None
     assert len(plan_calls) == 2
@@ -3077,7 +3130,7 @@ def test_mexc_tpsl_creation_failure_marks_trade_unprotected(client):
     assert result["live_status"] == "tp_sl_unprotected"
     assert trade.closed_at is None
     assert trade.tp_sl_protected is False
-    assert "live_mexc_order_failed" in trade.tp_sl_error
+    assert "protection_unconfirmed" in trade.tp_sl_error
 
 
 def test_manual_close_cancels_mexc_tpsl_orders(client):

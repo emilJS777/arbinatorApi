@@ -28,17 +28,25 @@ from src.PaperTrading.PaperOrderModel import PaperOrder
 from src.PaperTrading.PaperPositionModel import PaperPosition
 from src.Signal.TradeSignalModel import TradeSignal
 from src.Scanner.ScannerService import ScannerService
+from src.OrderBookRecovery.FuturesSnapshotStore import FuturesSnapshotStore
 from src.Strategy.StrategyConfigModel import StrategyConfig
 from src.TradingPair.TradingPairModel import TradingPair
 
 
 @pytest.fixture()
-def client():
+def client(monkeypatch):
+    # All live test traffic must go through explicit mocks.
+    import requests
+    def deny_network(*args, **kwargs):
+        raise AssertionError("real HTTP request forbidden in tests")
+    monkeypatch.setattr(requests.sessions.Session, "request", deny_network)
+    monkeypatch.setenv("LIVE_TRADING_HARD_DISABLED", "false")
     app.config["TESTING"] = True
     with app.app_context():
         db.drop_all()
         db.create_all()
         OrderBookSnapshotStore.clear()
+        FuturesSnapshotStore.clear()
         ArbitrageStrategyService._last_signal_at = {}
         OrderBookRecoveryService._last_evaluations = {}
         OrderBookRecoveryService._last_hook_seen_at = None
@@ -53,6 +61,7 @@ def client():
         yield app.test_client()
         db.session.remove()
         OrderBookSnapshotStore.clear()
+        FuturesSnapshotStore.clear()
         ArbitrageStrategyService._last_signal_at = {}
         OrderBookRecoveryService._last_evaluations = {}
         OrderBookRecoveryService._last_hook_seen_at = None

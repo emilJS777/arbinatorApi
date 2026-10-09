@@ -63,6 +63,26 @@ class CcxtService(CcxtServiceInterface):
             logger.warning("Failed to fetch order book for %s", pair)
             raise
 
+    def get_futures_order_book(self, pair: str, limit: int):
+        base = pair.upper().split(":")[0].replace("-", "/").replace("_", "/").split("/")[0]
+        if base.endswith("USDT"):
+            base = base[:-4]
+        markets = self._markets()
+        market = next((item for item in markets.values() if item.get("base") == base
+                       and item.get("quote") == "USDT" and item.get("settle") == "USDT"
+                       and item.get("swap") is True and item.get("linear") is True
+                       and item.get("active") is not False), None)
+        if not market:
+            raise ValueError("compatible_usdt_perpetual_unavailable")
+        book = self.exchange.fetch_order_book(market["symbol"], limit)
+        size = float(market.get("contractSize") or 1)
+        return {
+            "bids": [{"price": row[0], "amount": row[1] * size} for row in book.get("bids", [])],
+            "asks": [{"price": row[0], "amount": row[1] * size} for row in book.get("asks", [])],
+        }, {"market_type": "swap", "linear": True, "settle": "USDT", "resolved_symbol": market["symbol"],
+            "source_timestamp": book.get("timestamp"), "contract_size": size, "amount_unit": "base",
+            "limits": market.get("limits"), "precision": market.get("precision"), "precision_mode": self.exchange.precisionMode}
+
     def get_balance(self, symbol) -> Dict[str, float]:
         try:
             balance = self.exchange.fetch_balance()

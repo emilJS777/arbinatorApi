@@ -2975,6 +2975,15 @@ class OrderBookRecoveryService(Response):
     def paper_fill(self, snapshot, side, amount, config, current_time=None, not_before=None):
         if not snapshot:
             return None
+        current_time = current_time or datetime.utcnow()
+        source = (snapshot.get("metadata") or {}).get("source_timestamp")
+        if isinstance(source, (int, float)):
+            source = datetime.utcfromtimestamp(source / 1000 if source > 1e11 else source)
+        received = snapshot.get("updated_at")
+        # Clock-skew tolerance for diagnostics must never allow a future paper fill.
+        if (source and source > current_time) or (received and received > current_time):
+            self.observe_signal("execution_waiting", "future_book_not_available")
+            return None
         if not_before:
             source = (snapshot.get("metadata") or {}).get("source_timestamp")
             if isinstance(source, (int, float)):

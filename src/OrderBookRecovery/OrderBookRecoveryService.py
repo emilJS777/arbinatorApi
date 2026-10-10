@@ -3540,6 +3540,30 @@ class OrderBookRecoveryService(Response):
 
     def reconcile_existing_positions(self):
         """Read exchange state even when entry scanning is stopped or books are unavailable."""
+        self.__class__._paper_worker_heartbeat = datetime.utcnow()
+        paper_trades = StrategyRunTrade.query.filter(
+            StrategyRunTrade.execution_mode == "paper", StrategyRunTrade.closed_at.is_(None),
+            or_(StrategyRunTrade.live_status.is_(None), StrategyRunTrade.live_status != "paper_pending")).all()
+        for trade in paper_trades:
+            try:
+                config = self.lock_config(trade.strategy_config_id)
+                db.session.refresh(trade)
+                if trade.closed_at:
+                    db.session.commit()
+                    continue
+                frozen = self.trade_config(config, trade)
+                state = self.get_or_create_state(config)
+                now = datetime.utcnow()
+                snapshot = self.snapshot_for(trade.exchange, trade.symbol)
+                row = self.exchange_feature(frozen, snapshot, now, protective=True) if snapshot else {}
+                if row.get("valid"):
+                    self.evaluate_open_trade(trade, row["mid_price"], state, frozen, now)
+                else:
+                    trade.paper_exit_status = "unresolved_no_fresh_valid_book"
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+                logger.exception("Paper position management failed trade_id=%s", trade.id)
         pending = StrategyRunTrade.query.filter_by(execution_mode="paper", live_status="paper_pending", closed_at=None).all()
         for trade in pending:
             config = self.lock_config(trade.strategy_config_id)
@@ -3939,6 +3963,12 @@ class OrderBookRecoveryService(Response):
 
     def state_payload(self, config, state):
         open_trade = self.open_trade(config)
+        paper_exit = None
+        if open_trade and open_trade.execution_mode == "paper" and open_trade.live_status != "paper_pending":
+            from src.OrderBookRecovery.PaperExitDiagnostics import exit_diagnostics
+            paper_exit = exit_diagnostics(open_trade, self.trade_config(config, open_trade),
+                self.snapshot_for(open_trade.exchange, open_trade.symbol), datetime.utcnow(),
+                getattr(self.__class__, "_paper_worker_heartbeat", None))
         latest_snapshot = self.latest_snapshot_for(config)
         margin_limit = self.live_execution_service.margin_limit_debug(
             config,
@@ -3948,6 +3978,7 @@ class OrderBookRecoveryService(Response):
         return {
             "config": self.config_to_dict(config),
             "recovery_state": self.state_to_dict(state),
+            "paper_exit_diagnostics": paper_exit,
             "status": self.status_for(config, state),
             "enabled": config.enabled,
             "exchange": config.exchange,

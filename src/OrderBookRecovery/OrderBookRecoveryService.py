@@ -645,6 +645,8 @@ class OrderBookRecoveryService(Response):
         if not trade or trade.strategy_config_id != config.id:
             return self.response_not_found("Paper position not found")
         if trade.closed_at:
+            if trade.execution_mode == "paper":
+                return self.response_ok(self.trade_to_dict(trade))
             return self.response_err_msg("Paper position is already closed")
 
         config = self.trade_config(config, trade)
@@ -3747,7 +3749,16 @@ class OrderBookRecoveryService(Response):
         trade.closed_at = current_time
         trade.holding_seconds = (trade.closed_at - trade.opened_at).total_seconds() if trade.opened_at else None
         self.update_ml_snapshots_for_trade(trade)
-        self.apply_recovery_after_close(state, config, trade.result, current_time)
+        if trade.execution_mode == "paper":
+            # Exit parameters belong to the trade; next-entry sizing uses current risk settings.
+            next_config = db.session.get(OrderBookPatternStrategyConfig, trade.strategy_config_id)
+            was_paused = not next_config.enabled
+            pause_state = (state.is_stopped, state.stop_reason, state.paused_until)
+            self.apply_recovery_after_close(state, next_config, trade.result, current_time)
+            if was_paused:
+                state.is_stopped, state.stop_reason, state.paused_until = pause_state
+        else:
+            self.apply_recovery_after_close(state, config, trade.result, current_time)
         slot = db.session.get(ExecutionSlot, trade.strategy_config_id)
         if slot:
             db.session.delete(slot)

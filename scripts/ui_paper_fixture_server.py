@@ -4,9 +4,10 @@ Requires migrated arbinator_safety_test_ui_lifecycle on /tmp:55439.
 No real market observations, exchange credentials or network execution.
 """
 import os
+import json
 from pathlib import Path
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -84,8 +85,30 @@ def fixture_identity():
                    database='arbinator_safety_test_ui_lifecycle', project=str(ROOT))
 
 
+@app.post('/__fixture__/legacy-position')
+def fixture_legacy():
+    config = service.get_or_create_config()
+    if service.open_trade(config):
+        return jsonify(error='fixture_requires_flat'), 409
+    service.stop()
+    saved = service.config_to_dict(config)
+    for key in ('paper_session_id', 'risk_per_trade_percent', 'max_position_margin_usdt', 'max_consecutive_losses'):
+        saved.pop(key, None)
+    trade = StrategyRunTrade(strategy_config_id=config.id, execution_mode='paper', exchange=config.exchange,
+        symbol=config.symbol, side='short', margin=7, leverage=1, notional=7, amount=.07, entry_price=100,
+        pnl=0, paper_session_id=None, execution_config_json=None,
+        decision_snapshot_json=json.dumps({'config': saved}, default=str),
+        paper_close_requested_at=datetime.utcnow()-timedelta(seconds=3), paper_close_reason='manual_close',
+        paper_exit_status='pending_fixed_latency', opened_at=datetime.utcnow()-timedelta(minutes=5))
+    db.session.add(trade)
+    db.session.commit()
+    FuturesSnapshotStore.clear()
+    return jsonify(id=trade.id, fixture=True)
+
+
 if __name__ == '__main__':
     with app.app_context():
         assert db.engine.url.database == 'arbinator_safety_test_ui_lifecycle'
-        seed()
+        if os.environ.get('ARBI_TEST_RESUME') != '1':
+            seed()
     app.run(host='127.0.0.1', port=5587, debug=False, use_reloader=False, threaded=True)

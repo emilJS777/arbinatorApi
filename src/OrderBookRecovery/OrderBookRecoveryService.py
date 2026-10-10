@@ -13,11 +13,12 @@ from types import SimpleNamespace
 import math
 
 from flask import jsonify, make_response, send_file
-from sqlalchemy import inspect
+from sqlalchemy import inspect, Boolean, Float, Integer
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 
 from src import db
+from src.OrderBookRecovery.RuntimeDiagnostics import runtime_diagnostics
 from src.OrderBookRecovery.FuturesSnapshotStore import FuturesSnapshotStore as OrderBookSnapshotStore
 from src.Exchange.ExchangeModel import Exchange
 from src.OrderBookRecovery.OrderBookRecoveryModel import (
@@ -40,6 +41,7 @@ from src.OrderBookRecovery.SignalRules import consensus_side, direction_rejectio
 from src.OrderBookRecovery.DepthExecution import consume_book
 from src.OrderBookRecovery.PositionGuardian import PositionGuardian
 from src.OrderBookRecovery.PaperContractRules import executable_amount
+from src.OrderBookRecovery.LifecycleSafety import LifecycleValidationError, log_incident
 from src.TradingPair.TradingPairModel import TradingPair
 from src.Socket.EventPublisher import EventPublisher
 from src.__Parents.Response import Response
@@ -96,15 +98,24 @@ class OrderBookRecoveryService(Response):
         db.session.commit()
         return config
 
-    def get_or_create_state(self, config=None):
+    def get_or_create_state(self, config=None, commit=True):
         config = config or self.get_or_create_config()
         state = RecoveryState.query.filter_by(strategy_config_id=config.id).first()
         if state:
             return state
         state = RecoveryState(strategy_config_id=config.id, current_margin=config.base_margin_usdt)
         db.session.add(state)
-        db.session.commit()
+        if commit:
+            db.session.commit()
+        else:
+            db.session.flush()
         return state
+
+    def publish_committed(self, topic, payload):
+        try:
+            self.publisher.publish(topic, payload)
+        except Exception as error:
+            log_incident(error, "notification." + topic)
 
     def config_response(self):
         return self.response_ok(self.config_to_dict(self.get_or_create_config()))
@@ -278,6 +289,23 @@ class OrderBookRecoveryService(Response):
 
     def update_config(self, body: dict):
         config = self.lock_config(self.get_or_create_config().id)
+        for key, value in body.items():
+            column = OrderBookPatternStrategyConfig.__table__.columns.get(key)
+            if column is not None and not column.nullable and value is None:
+                return self.validation_error("invalid_" + key)
+            if column is not None and value is not None:
+                if isinstance(column.type, Boolean) and not isinstance(value, bool):
+                    return self.validation_error("invalid_" + key)
+                if isinstance(column.type, (Float, Integer)):
+                    try:
+                        number = float(value)
+                        if isinstance(value, bool) or not math.isfinite(number) or (isinstance(column.type, Integer) and not number.is_integer()):
+                            return self.validation_error("invalid_" + key)
+                    except (TypeError, ValueError):
+                        return self.validation_error("invalid_" + key)
+        for key, allowed in (("execution_mode", {"paper", "live"}), ("entry_mode", {"instant", "two_step_confirmation"}), ("ml_mode", {"disabled", "shadow"})):
+            if key in body and (not isinstance(body[key], str) or body[key] not in allowed):
+                return self.validation_error("invalid_" + key)
         if "emergency_entry_block" in body and not isinstance(body["emergency_entry_block"], bool):
             return self.validation_error("invalid_emergency_entry_block")
         logger.info("OrderBookRecovery config PATCH received keys=%s ml_mode=%s", sorted(body.keys()), body.get("ml_mode"))
@@ -294,7 +322,11 @@ class OrderBookRecoveryService(Response):
                         or self.__class__._pending_entries.get(self.pending_key(config))):
             return self.validation_error("cannot_change_execution_config_with_open_position")
         block_changed = "emergency_entry_block" in body and body["emergency_entry_block"] != config.emergency_entry_block
-        self.apply_config_overrides(config, body)
+        try:
+            self.apply_config_overrides(config, body)
+        except (ValueError, TypeError) as error:
+            code = str(error)
+            raise LifecycleValidationError(code if code.startswith("invalid_") else "invalid_config_value", 400) from error
         logger.info("OrderBookRecovery config after overrides id=%s ml_mode=%s", config.id, config.ml_mode)
         if exchange and trading_pair:
             config.exchange_id = exchange.id
@@ -312,17 +344,17 @@ class OrderBookRecoveryService(Response):
                 self.cancel_paper_entry(trade, "emergency_entry_block", datetime.utcnow(), commit=False)
             self.clear_pending_entry(config, "cancelled", "emergency_entry_block")
         config.paper_mode_only = True
-        state = self.get_or_create_state(config)
+        state = self.get_or_create_state(config, commit=False)
         if block_changed:
             state.is_stopped = True
             state.stop_reason = "emergency_entry_block" if config.emergency_entry_block else "manual_stop"
         if state.current_margin <= 0:
             state.current_margin = config.base_margin_usdt
+        db.session.flush()
+        response = self.response_ok(self.config_to_dict(config))
         db.session.commit()
-        db.session.expire(config)
-        reloaded = db.session.get(OrderBookPatternStrategyConfig, config.id)
-        logger.info("OrderBookRecovery config committed/reloaded id=%s ml_mode=%s", reloaded.id, reloaded.ml_mode)
-        return self.response_ok(self.config_to_dict(reloaded))
+        logger.info("OrderBookRecovery config committed id=%s ml_mode=%s", config.id, config.ml_mode)
+        return response
 
     @staticmethod
     def median(values):
@@ -337,7 +369,16 @@ class OrderBookRecoveryService(Response):
     def start_paper(self):
         config = self.get_or_create_config()
         config = self.lock_config(config.id)
+        if config.execution_mode not in {"paper", "live"}:
+            return self.validation_error("invalid_execution_mode")
+        if config.execution_mode == "paper" and config.emergency_entry_block:
+            return self.validation_error("emergency_entry_block")
+        state = self.get_or_create_state(config, commit=False)
+        if config.execution_mode == "paper" and config.enabled and not state.is_stopped and self.active_run(config):
+            return self.response_ok(self.state_payload(config, state))
         if config.execution_mode == "paper" and not config.paper_session_id and not self.open_trade(config):
+            if db.session.get(ExecutionSlot, config.id):
+                return self.response_conflict("execution_reconciliation_required")
             self.create_paper_session(config)
         if config.execution_mode == "live":
             reason = self.live_start_rejection(config)
@@ -345,7 +386,6 @@ class OrderBookRecoveryService(Response):
                 return self.response(False, {"msg": reason}, 400)
         config.enabled = True
         config.paper_mode_only = True
-        state = self.get_or_create_state(config)
         state.is_stopped = False
         state.stop_reason = None
         if state.current_margin <= 0:
@@ -357,15 +397,20 @@ class OrderBookRecoveryService(Response):
             existing_run.stop_reason = "restarted"
         run = StrategyRun(strategy_config_id=config.id, status="running")
         db.session.add(run)
+        db.session.flush()
+        payload = self.state_payload(config, state)
+        response = self.response_ok(payload)
         db.session.commit()
         logger.info("OrderBookRecovery strategy started: exchange=%s symbol=%s run_id=%s", config.exchange, config.symbol, run.id)
-        self.start_ml_market_labeler()
-        payload = self.state_payload(config, state)
-        self.publisher.publish("orderbook_recovery.started", payload)
-        return self.response_ok(payload)
+        try:
+            self.start_ml_market_labeler()
+        except Exception as error:
+            log_incident(error, "ml_labeler.start")
+        self.publish_committed("orderbook_recovery.started", payload)
+        return response
 
     def live_start_rejection(self, config):
-        state = self.get_or_create_state(config)
+        state = self.get_or_create_state(config, commit=False)
         reason = self.live_execution_service.validate_enabled(config, state.current_margin or config.base_margin_usdt)
         if reason:
             return reason
@@ -413,7 +458,7 @@ class OrderBookRecoveryService(Response):
         for trade in StrategyRunTrade.query.filter_by(strategy_config_id=config.id, execution_mode="paper", live_status="paper_pending", closed_at=None).all():
             self.cancel_paper_entry(trade, "paused", datetime.utcnow(), commit=False)
         self.clear_pending_entry(config, "cancelled", "manual_stop")
-        state = self.get_or_create_state(config)
+        state = self.get_or_create_state(config, commit=False)
         state.is_stopped = True
         state.stop_reason = reason
         run = self.active_run(config)
@@ -421,17 +466,21 @@ class OrderBookRecoveryService(Response):
             run.status = "stopped"
             run.stopped_at = datetime.utcnow()
             run.stop_reason = reason
+        db.session.flush()
+        payload = self.state_payload(config, state)
+        response = self.response_ok(payload)
         db.session.commit()
         logger.info("OrderBookRecovery strategy stopped: exchange=%s symbol=%s reason=%s", config.exchange, config.symbol, reason)
-        payload = self.state_payload(config, state)
-        self.publisher.publish("orderbook_recovery.stopped", payload)
-        return self.response_ok(payload)
+        self.publish_committed("orderbook_recovery.stopped", payload)
+        return response
 
     def lock_config(self, config_id):
         # Serialize Pause, reservation and paper fill across processes (PostgreSQL).
         return OrderBookPatternStrategyConfig.query.filter_by(id=config_id).populate_existing().with_for_update().one()
 
     def create_paper_session(self, config):
+        if config.paper_equity_usdt is None or not math.isfinite(float(config.paper_equity_usdt)) or float(config.paper_equity_usdt) <= 0:
+            raise LifecycleValidationError("invalid_paper_equity_usdt", 400)
         previous = db.session.get(PaperSession, config.paper_session_id) if config.paper_session_id else None
         if previous:
             previous.ended_at = datetime.utcnow()
@@ -449,15 +498,17 @@ class OrderBookRecoveryService(Response):
     def new_paper_session(self):
         config = self.lock_config(self.get_or_create_config().id)
         if config.execution_mode != "paper" or config.enabled or self.open_trade(config) or db.session.get(ExecutionSlot, config.id):
-            return self.response_err_msg("paper_session_requires_paused_and_flat")
+            return self.response_conflict("paper_session_requires_paused_and_flat")
         self.create_paper_session(config)
-        state = self.get_or_create_state(config)
+        state = self.get_or_create_state(config, commit=False)
         state.current_step, state.current_margin, state.consecutive_losses = 0, config.base_margin_usdt, 0
         state.last_closed_at = state.last_opened_at = state.last_trade_result = state.paused_until = None
         state.is_stopped, state.stop_reason = True, "manual_stop"
         self.clear_pending_entry(config, "cancelled", "new_paper_session")
+        db.session.flush()
+        response = self.response_ok(self.state_payload(config, state))
         db.session.commit()
-        return self.response_ok(self.state_payload(config, state))
+        return response
 
     def paper_initial_equity(self, config):
         session_id = getattr(config, "paper_session_id", None)
@@ -666,22 +717,22 @@ class OrderBookRecoveryService(Response):
         if not trade or trade.strategy_config_id != config.id:
             return self.response_not_found("Paper position not found")
         if trade.closed_at:
-            if trade.execution_mode == "paper":
+            if trade.execution_mode != "live":
                 return self.response_ok(self.trade_to_dict(trade))
-            return self.response_err_msg("Paper position is already closed")
+            return self.response_conflict("position_already_closed")
 
         config = self.trade_config(config, trade)
-        if trade.execution_mode == "paper":
+        if trade.execution_mode != "live":
             # Persist a close request even without executable data; never pretend it filled.
             return self.response_ok(self.close_trade(trade, 0, trade.pnl, "manual_close", state, config, datetime.utcnow()))
         snapshot = self.snapshot_for(trade.exchange, trade.symbol)
         if not snapshot:
-            return self.response_err_msg("cannot_close_without_valid_market_price")
+            return self.validation_error("cannot_close_without_valid_market_price")
         normalized, reject_reason = OrderBookNormalizer.normalize(snapshot.get("order_book") or {})
         if reject_reason:
-            return self.response_err_msg("cannot_close_without_valid_market_price")
+            return self.validation_error("cannot_close_without_valid_market_price")
         if not self.exchange_feature(config, snapshot, datetime.utcnow(), protective=True).get("valid"):
-            return self.response_err_msg("cannot_close_without_valid_market_price")
+            return self.validation_error("cannot_close_without_valid_market_price")
 
         current_time = datetime.utcnow()
         features, reject_reason = self.features(config, snapshot)
@@ -946,6 +997,8 @@ class OrderBookRecoveryService(Response):
     def parse_json(self, value):
         if not value:
             return None
+        if isinstance(value, (dict, list)):
+            return value
         try:
             return json.loads(value)
         except (TypeError, ValueError):
@@ -3055,12 +3108,41 @@ class OrderBookRecoveryService(Response):
             if not PositionGuardian(self).prepare_legacy(current_config, trade):
                 raise LiveExecutionError("legacy_trade_requires_execution_config_review")
         payload = self.parse_json(trade.execution_config_json)
-        if not payload:
-            payload = (self.parse_json(trade.decision_snapshot_json) or {}).get("config")
+        if not isinstance(payload, dict) or not payload:
+            decision = self.parse_json(trade.decision_snapshot_json)
+            payload = decision.get("config") if isinstance(decision, dict) else None
         if not isinstance(payload, dict):
             # Legacy positions may only be reconciled after explicit review.
+            if trade.execution_mode != "live":
+                raise LifecycleValidationError("legacy_paper_execution_config_review_required")
             raise LiveExecutionError("legacy_trade_requires_execution_config_review")
         payload = dict(payload)
+        if trade.execution_mode != "live":
+            required = ("paper_latency_ms", "paper_taker_fee_percent", "max_snapshot_age_seconds",
+                        "take_profit_percent_of_margin", "stop_loss_percent_of_margin",
+                        "momentum_window_snapshots", "long_imbalance_threshold", "short_imbalance_threshold",
+                        "imbalance_anomaly_min", "imbalance_anomaly_max")
+            missing = [key for key in required if payload.get(key) is None]
+            if missing:
+                raise LifecycleValidationError("legacy_paper_execution_config_review_required", fields=missing)
+            invalid = []
+            for key in required:
+                try:
+                    value = float(payload[key])
+                    if not math.isfinite(value) or value < 0 or (key == "max_snapshot_age_seconds" and value <= 0):
+                        invalid.append(key)
+                except (TypeError, ValueError):
+                    invalid.append(key)
+            for key in ("entry_price", "amount", "notional", "margin", "leverage"):
+                try:
+                    if not math.isfinite(float(getattr(trade, key))) or float(getattr(trade, key)) <= 0:
+                        invalid.append(key)
+                except (TypeError, ValueError):
+                    invalid.append(key)
+            if trade.side not in {"long", "short"}:
+                invalid.append("side")
+            if invalid:
+                raise LifecycleValidationError("legacy_paper_execution_config_review_required", fields=invalid)
         payload.update(id=trade.strategy_config_id, exchange=trade.exchange, symbol=trade.symbol,
                        execution_mode=trade.execution_mode or "paper", leverage=trade.leverage)
         return SimpleNamespace(**payload)
@@ -3565,9 +3647,10 @@ class OrderBookRecoveryService(Response):
         """Read exchange state even when entry scanning is stopped or books are unavailable."""
         self.__class__._paper_worker_heartbeat = datetime.utcnow()
         paper_trades = StrategyRunTrade.query.filter(
-            StrategyRunTrade.execution_mode == "paper", StrategyRunTrade.closed_at.is_(None),
+            or_(StrategyRunTrade.execution_mode == "paper", StrategyRunTrade.execution_mode.is_(None)), StrategyRunTrade.closed_at.is_(None),
             or_(StrategyRunTrade.live_status.is_(None), StrategyRunTrade.live_status != "paper_pending")).all()
         for trade in paper_trades:
+            trade_id = trade.id
             try:
                 config = self.lock_config(trade.strategy_config_id)
                 db.session.refresh(trade)
@@ -3584,19 +3667,35 @@ class OrderBookRecoveryService(Response):
                 else:
                     trade.paper_exit_status = "unresolved_no_fresh_valid_book"
                 db.session.commit()
-            except Exception:
+            except LifecycleValidationError as error:
                 db.session.rollback()
-                logger.exception("Paper position management failed trade_id=%s", trade.id)
+                logger.warning("Paper management review required trade_id=%s code=%s fields=%s", trade_id, error.code, error.fields)
+            except Exception as error:
+                db.session.rollback()
+                log_incident(error, "paper_worker.trade_" + str(trade_id))
         pending = StrategyRunTrade.query.filter_by(execution_mode="paper", live_status="paper_pending", closed_at=None).all()
         for trade in pending:
-            config = self.lock_config(trade.strategy_config_id)
-            db.session.refresh(trade)
-            now = datetime.utcnow()
-            expiry = trade.pending_entry_expires_at or trade.opened_at + timedelta(seconds=5)
-            if now >= expiry or not config.enabled or config.emergency_entry_block:
-                self.cancel_paper_entry(trade, "expired" if now >= expiry else "paused", now)
-            else:
-                db.session.commit()
+            trade_id = trade.id
+            try:
+                config = self.lock_config(trade.strategy_config_id)
+                db.session.refresh(trade)
+                now = datetime.utcnow()
+                if not config.enabled or config.emergency_entry_block:
+                    self.cancel_paper_entry(trade, "paused", now)
+                    continue
+                if not trade.pending_entry_expires_at and not trade.opened_at:
+                    raise LifecycleValidationError("legacy_pending_entry_review_required", fields=["opened_at"])
+                expiry = trade.pending_entry_expires_at or trade.opened_at + timedelta(seconds=5)
+                if now >= expiry:
+                    self.cancel_paper_entry(trade, "expired", now)
+                else:
+                    db.session.commit()
+            except LifecycleValidationError as error:
+                db.session.rollback()
+                logger.warning("Pending paper review required trade_id=%s code=%s fields=%s", trade_id, error.code, error.fields)
+            except Exception as error:
+                db.session.rollback()
+                log_incident(error, "paper_worker.pending_" + str(trade_id))
         trades = StrategyRunTrade.query.filter(
             StrategyRunTrade.execution_mode == "live", StrategyRunTrade.closed_at.is_(None),
             StrategyRunTrade.live_status.isnot(None)).all()
@@ -3687,7 +3786,7 @@ class OrderBookRecoveryService(Response):
         return payload
 
     def close_trade(self, trade, exit_price, pnl, reason, state, config, current_time):
-        if trade.execution_mode == "paper":
+        if trade.execution_mode != "live":
             self.lock_config(trade.strategy_config_id)
             db.session.refresh(trade)
             if trade.live_status == "paper_pending":
@@ -3695,7 +3794,7 @@ class OrderBookRecoveryService(Response):
         if trade.closed_at:
             return self.trade_to_dict(trade)
         config = self.trade_config(config, trade)
-        if trade.execution_mode == "paper" and not trade.paper_close_requested_at:
+        if trade.execution_mode != "live" and not trade.paper_close_requested_at:
             trade.paper_close_requested_at = current_time
             trade.paper_close_reason = reason
             trade.paper_exit_status = "pending_fixed_latency"
@@ -3770,7 +3869,7 @@ class OrderBookRecoveryService(Response):
         trade.closed_at = current_time
         trade.holding_seconds = (trade.closed_at - trade.opened_at).total_seconds() if trade.opened_at else None
         self.update_ml_snapshots_for_trade(trade)
-        if trade.execution_mode == "paper":
+        if trade.execution_mode != "live":
             # Exit parameters belong to the trade; next-entry sizing uses current risk settings.
             next_config = db.session.get(OrderBookPatternStrategyConfig, trade.strategy_config_id)
             was_paused = not next_config.enabled
@@ -3786,7 +3885,7 @@ class OrderBookRecoveryService(Response):
         db.session.commit()
         payload = self.trade_to_dict(trade)
         logger.info("OrderBookRecovery position closed: trade_id=%s reason=%s pnl=%s", trade.id, reason, pnl)
-        if trade.execution_mode == "paper":
+        if trade.execution_mode != "live":
             try:
                 self.publisher.publish("orderbook_recovery.position_closed", payload)
             except Exception as error:
@@ -4003,11 +4102,14 @@ class OrderBookRecoveryService(Response):
     def state_payload(self, config, state):
         open_trade = self.open_trade(config)
         paper_exit = None
-        if open_trade and open_trade.execution_mode == "paper" and open_trade.live_status != "paper_pending":
+        if open_trade and open_trade.execution_mode != "live" and open_trade.live_status != "paper_pending":
             from src.OrderBookRecovery.PaperExitDiagnostics import exit_diagnostics
-            paper_exit = exit_diagnostics(open_trade, self.trade_config(config, open_trade),
-                self.snapshot_for(open_trade.exchange, open_trade.symbol), datetime.utcnow(),
-                getattr(self.__class__, "_paper_worker_heartbeat", None))
+            try:
+                paper_exit = exit_diagnostics(open_trade, self.trade_config(config, open_trade),
+                    self.snapshot_for(open_trade.exchange, open_trade.symbol), datetime.utcnow(),
+                    getattr(self.__class__, "_paper_worker_heartbeat", None))
+            except LifecycleValidationError as error:
+                paper_exit = {"exit_block_reason": error.code, "missing_fields": error.fields}
         latest_snapshot = self.latest_snapshot_for(config)
         margin_limit = self.live_execution_service.margin_limit_debug(
             config,
@@ -4015,6 +4117,7 @@ class OrderBookRecoveryService(Response):
             config.leverage,
         )
         return {
+            "runtime_diagnostics": runtime_diagnostics(),
             "config": self.config_to_dict(config),
             "recovery_state": self.state_to_dict(state),
             "paper_exit_diagnostics": paper_exit,

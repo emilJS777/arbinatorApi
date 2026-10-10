@@ -3591,6 +3591,7 @@ def test_forward_test_creates_run_and_status(client):
 
 
 def test_start_changes_state_to_running(client):
+    make_config(OrderBookRecoveryService())
     response = client.post("/api/orderbook-recovery/start-paper", json={})
 
     assert response.status_code == 200
@@ -3600,6 +3601,7 @@ def test_start_changes_state_to_running(client):
 
 
 def test_debug_endpoint_returns_reason_when_no_snapshot(client):
+    make_config(OrderBookRecoveryService())
     client.post("/api/orderbook-recovery/start-paper", json={})
 
     response = client.get("/api/orderbook-recovery/debug")

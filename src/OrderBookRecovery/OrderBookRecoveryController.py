@@ -1,18 +1,16 @@
 from src.OrderBookRecovery.OrderBookRecoveryService import OrderBookRecoveryService
 from src.__Parents.Controller import Controller
-import logging
-import traceback
-from uuid import uuid4
-from src import db
-from flask import jsonify, make_response
+from src.OrderBookRecovery.LifecycleSafety import lifecycle_endpoint
 
 
 class OrderBookRecoveryConfigController(Controller):
     service = OrderBookRecoveryService()
 
+    @lifecycle_endpoint("config")
     def get(self):
         return self.service.config_response()
 
+    @lifecycle_endpoint("save")
     def patch(self):
         return self.service.update_config(self.request.get_json() or {})
 
@@ -34,6 +32,7 @@ class OrderBookRecoveryOptionsController(Controller):
 class OrderBookRecoveryStartController(Controller):
     service = OrderBookRecoveryService()
 
+    @lifecycle_endpoint("start")
     def post(self):
         return self.service.start_paper()
 
@@ -41,6 +40,7 @@ class OrderBookRecoveryStartController(Controller):
 class OrderBookRecoveryStopController(Controller):
     service = OrderBookRecoveryService()
 
+    @lifecycle_endpoint("pause")
     def post(self):
         body = self.request.get_json() or {}
         return self.service.stop(body.get("reason") or "manual_stop")
@@ -49,6 +49,7 @@ class OrderBookRecoveryStopController(Controller):
 class OrderBookRecoveryPaperSessionController(Controller):
     service = OrderBookRecoveryService()
 
+    @lifecycle_endpoint("paper_session")
     def post(self):
         return self.service.new_paper_session()
 
@@ -56,6 +57,7 @@ class OrderBookRecoveryPaperSessionController(Controller):
 class OrderBookRecoveryStateController(Controller):
     service = OrderBookRecoveryService()
 
+    @lifecycle_endpoint("state")
     def get(self):
         return self.service.state_response()
 
@@ -63,6 +65,7 @@ class OrderBookRecoveryStateController(Controller):
 class OrderBookRecoveryTradeController(Controller):
     service = OrderBookRecoveryService()
 
+    @lifecycle_endpoint("trades")
     def get(self):
         include_archived = str(self.request.args.get("include_archived", "false")).lower() == "true"
         return self.service.trades_response(include_archived)
@@ -71,6 +74,7 @@ class OrderBookRecoveryTradeController(Controller):
 class OrderBookRecoveryMetricsController(Controller):
     service = OrderBookRecoveryService()
 
+    @lifecycle_endpoint("metrics")
     def get(self):
         return self.service.metrics_response()
 
@@ -78,6 +82,7 @@ class OrderBookRecoveryMetricsController(Controller):
 class OrderBookRecoveryDebugController(Controller):
     service = OrderBookRecoveryService()
 
+    @lifecycle_endpoint("debug")
     def get(self):
         return self.service.debug_response()
 
@@ -127,21 +132,9 @@ class OrderBookRecoveryForwardTestMetricsController(Controller):
 class OrderBookRecoveryManualCloseController(Controller):
     service = OrderBookRecoveryService()
 
+    @lifecycle_endpoint("close")
     def post(self, position_id: int):
-        body = self.request.get_json() or {}
-        try:
-            return self.service.close_manual(position_id, body)
-        except Exception as error:
-            db.session.rollback()
-            incident_id = uuid4().hex
-            # No SQL parameters, payloads, credentials or exception message in this diagnostic.
-            frames = [{"file": frame.filename, "line": frame.lineno, "function": frame.name}
-                      for frame in traceback.extract_tb(error.__traceback__)]
-            logging.getLogger(__name__).error(
-                "paper/live close failed incident_id=%s position_id=%s error_class=%s traceback=%s",
-                incident_id, position_id, type(error).__name__, frames)
-            return make_response(jsonify(success=False, obj={"msg": "close_failed_internal",
-                "incident_id": incident_id, "position_id": position_id}), 500)
+        return self.service.close_manual(position_id, self.request.get_json() or {})
 
 
 class OrderBookRecoveryTradeArchiveController(Controller):

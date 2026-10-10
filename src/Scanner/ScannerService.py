@@ -366,8 +366,9 @@ class ScannerService:
                     db.session.remove()
         try:
             await asyncio.to_thread(reconcile)
-        except Exception:
-            logger.exception("Periodic position reconciliation failed")
+        except Exception as error:
+            from src.OrderBookRecovery.LifecycleSafety import log_incident
+            log_incident(error, "position_worker")
 
     async def fetch_balance(self, exchange, pair, symbol):
         async with self._semaphore:

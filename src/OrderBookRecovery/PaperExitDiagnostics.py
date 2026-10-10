@@ -40,5 +40,12 @@ def exit_diagnostics(trade, config, snapshot, now, heartbeat=None):
         'worker_heartbeat': heartbeat.isoformat() + 'Z' if heartbeat else None,
         'worker_age_seconds': max(0, (now - heartbeat).total_seconds()) if heartbeat else None,
         'worker_scope': 'current_process',
+        'snapshot_scope': 'current_process',
+        'book_received_at': received.isoformat() + 'Z' if isinstance(received, datetime) else None,
+        'book_source_at': source.isoformat() + 'Z' if isinstance(source, datetime) else None,
+        'execution_exchange': getattr(trade, 'exchange', None),
+        'execution_symbol': getattr(trade, 'symbol', None),
+        'resolved_book_symbol': metadata.get('resolved_symbol'),
+        'book_market_type': metadata.get('market_type'),
         'exit_block_reason': reason or ('awaiting_management_tick' if requested else 'monitoring'),
     }

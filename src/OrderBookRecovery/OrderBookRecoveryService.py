@@ -712,6 +712,23 @@ class OrderBookRecoveryService(Response):
             return self.response_not_found("Forward test not found")
         return self.response_ok(self.metrics_for_run(run))
 
+    def paper_abandonment_safety_reason(self, trade, slot):
+        error = abandonment_mode_error(trade, self.parse_json)
+        if error or TradeFundingEvent.query.filter_by(trade_id=trade.id).first():
+            return error or "abandon_rejected_live_execution_evidence"
+        if slot and slot.trade_id == trade.id and slot.status != "active":
+            return "abandon_rejected_unknown_execution_slot"
+        return None
+
+    def paper_abandonment_diagnostics(self, config, trade, error):
+        slot = db.session.get(ExecutionSlot, trade.strategy_config_id)
+        reason = self.paper_abandonment_safety_reason(trade, slot)
+        allowed = (error.code == "legacy_paper_execution_config_review_required" and
+                   not trade.closed_at and not trade.abandoned_at and reason is None)
+        return {"position_id": trade.id, "abandon_allowed": allowed,
+                "abandon_requires_pause": bool(allowed and config.enabled),
+                "abandon_block_reason": reason or ("pause_entries_before_abandon" if allowed and config.enabled else None)}
+
     def abandon_legacy_paper(self, position_id: int, body: dict):
         if body.get("confirm_abandon") is not True or type(body.get("position_id")) is not int or body["position_id"] != position_id:
             raise LifecycleValidationError("abandon_confirmation_position_id_required", status=400)
@@ -720,12 +737,10 @@ class OrderBookRecoveryService(Response):
         trade = StrategyRunTrade.query.filter_by(id=position_id, strategy_config_id=config.id).populate_existing().with_for_update().first()
         if not trade:
             return self.response_not_found("Paper position not found")
-        error = abandonment_mode_error(trade, self.parse_json)
-        if error or TradeFundingEvent.query.filter_by(trade_id=trade.id).first():
-            raise LifecycleValidationError(error or "abandon_rejected_live_execution_evidence")
         slot = ExecutionSlot.query.filter_by(strategy_config_id=config.id, trade_id=trade.id).with_for_update().first()
-        if slot and slot.status != "active":
-            raise LifecycleValidationError("abandon_rejected_unknown_execution_slot")
+        error = self.paper_abandonment_safety_reason(trade, slot)
+        if error:
+            raise LifecycleValidationError(error)
         if trade.abandoned_at:
             return self.response_ok(self.trade_to_dict(trade))
         if config.enabled:
@@ -763,6 +778,9 @@ class OrderBookRecoveryService(Response):
         trade = db.session.get(StrategyRunTrade, position_id)
         if not trade or trade.strategy_config_id != config.id:
             return self.response_not_found("Paper position not found")
+        if trade.execution_mode == "paper":
+            config = self.lock_config(config.id)
+            db.session.refresh(trade)
         if trade.abandoned_at:
             return self.response_ok(self.trade_to_dict(trade))
         if trade.closed_at:
@@ -770,7 +788,11 @@ class OrderBookRecoveryService(Response):
                 return self.response_ok(self.trade_to_dict(trade))
             return self.response_conflict("position_already_closed")
 
-        config = self.trade_config(config, trade)
+        try:
+            config = self.trade_config(config, trade)
+        except LifecycleValidationError as error:
+            raise LifecycleValidationError(error.code, status=error.status, fields=error.fields,
+                details=self.paper_abandonment_diagnostics(config, trade, error)) from error
         if trade.execution_mode != "live":
             # Persist a close request even without executable data; never pretend it filled.
             return self.response_ok(self.close_trade(trade, 0, trade.pnl, "manual_close", state, config, datetime.utcnow()))
@@ -4174,12 +4196,7 @@ class OrderBookRecoveryService(Response):
                     getattr(self.__class__, "_paper_worker_heartbeat", None))
             except LifecycleValidationError as error:
                 paper_exit = {"exit_block_reason": error.code, "missing_fields": error.fields}
-                paper_exit["abandon_allowed"] = (error.code == "legacy_paper_execution_config_review_required" and
-                    abandonment_mode_error(open_trade, self.parse_json) is None and
-                    not TradeFundingEvent.query.filter_by(trade_id=open_trade.id).first())
-                slot = db.session.get(ExecutionSlot, config.id)
-                if slot and slot.trade_id == open_trade.id and slot.status != "active":
-                    paper_exit["abandon_allowed"] = False
+                paper_exit.update(self.paper_abandonment_diagnostics(config, open_trade, error))
         latest_snapshot = self.latest_snapshot_for(config)
         margin_limit = self.live_execution_service.margin_limit_debug(
             config,

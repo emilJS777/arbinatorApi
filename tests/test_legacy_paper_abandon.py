@@ -5,6 +5,7 @@ from src.OrderBookRecovery.OrderBookRecoveryModel import StrategyRunTrade, Execu
 from src.OrderBookRecovery.OrderBookRecoveryService import OrderBookRecoveryService
 from test_execution_safety import setup_service
 from test_legacy_paper_close import legacy_position
+import json
 
 
 def blocked_position():
@@ -150,3 +151,55 @@ def test_unknown_slot_prevents_abandonment(client):
     assert response.status_code==409
     assert response.json['obj']['code']=='abandon_rejected_unknown_execution_slot'
     assert db.session.get(StrategyRunTrade,trade_id).abandoned_at is None
+
+
+def test_hosted_4027_missing_fee_latency_returns_actionable_409_without_mutation(client):
+    service, config, state = setup_service()
+    config.take_profit_percent_of_margin, config.stop_loss_percent_of_margin = 1.8, .9
+    trade = legacy_position(service, config)
+    frozen = json.loads(trade.decision_snapshot_json)
+    for key in ('paper_latency_ms', 'paper_taker_fee_percent'):
+        frozen['config'].pop(key)
+    trade.id = 4027
+    trade.decision_snapshot_json = json.dumps(frozen)
+    trade.paper_close_requested_at = None
+    trade.paper_close_reason = None
+    trade.paper_exit_status = 'unresolved_no_fresh_valid_book'
+    config.enabled = True
+    db.session.add(ExecutionSlot(strategy_config_id=config.id, trade_id=4027, client_order_id='paper_4027', status='active'))
+    db.session.commit()
+    before = (trade.entry_price, trade.exit_price, trade.pnl, trade.closed_at, trade.paper_close_requested_at)
+    response = client.post('/api/orderbook-recovery/positions/4027/close-manual', json={'reason':'manual_close'})
+    assert response.status_code == 409
+    assert response.json['obj']['fields'] == ['paper_latency_ms','paper_taker_fee_percent']
+    assert response.json['obj']['position_id'] == 4027
+    assert response.json['obj']['abandon_allowed'] is True
+    assert response.json['obj']['abandon_requires_pause'] is True
+    assert response.json['obj']['abandon_block_reason'] == 'pause_entries_before_abandon'
+    db.session.expire_all()
+    trade = db.session.get(StrategyRunTrade,4027)
+    assert (trade.entry_price,trade.exit_price,trade.pnl,trade.closed_at,trade.paper_close_requested_at) == before
+    payload = client.get('/api/orderbook-recovery/state').json['obj']
+    assert payload['runtime_diagnostics']['paper_abandonment_supported'] is True
+    assert payload['paper_exit_diagnostics']['abandon_allowed'] is True
+    assert abandon(client,4027).json['obj']['code'] == 'pause_entries_before_abandon'
+    assert client.post('/api/orderbook-recovery/stop',json={}).status_code == 200
+    first = abandon(client,4027)
+    assert first.status_code == 200
+    assert abandon(client,4027).json['obj']['abandoned_at'] == first.json['obj']['abandoned_at']
+    assert client.get('/api/orderbook-recovery/state').json['obj']['open_position'] is None
+    assert db.session.get(StrategyRunTrade,4027).closed_at is None
+    assert service.get_or_create_config().take_profit_percent_of_margin == 1.8
+    assert service.get_or_create_config().stop_loss_percent_of_margin == .9
+
+
+def test_409_and_state_agree_when_live_evidence_prevents_abandonment(client):
+    _, _, _, trade = blocked_position()
+    trade.live_exchange_order_id = 'evidence-must-be-preserved'
+    db.session.commit()
+    response = client.post(f'/api/orderbook-recovery/positions/{trade.id}/close-manual',json={})
+    assert response.status_code == 409
+    assert response.json['obj']['abandon_allowed'] is False
+    assert response.json['obj']['abandon_block_reason'] == 'abandon_rejected_live_execution_evidence'
+    state = client.get('/api/orderbook-recovery/state').json['obj']
+    assert state['paper_exit_diagnostics']['abandon_allowed'] is False

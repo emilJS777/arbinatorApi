@@ -24,7 +24,7 @@ from flask import request, jsonify
 from src import app, db
 from src.Exchange.ExchangeModel import Exchange
 from src.TradingPair.TradingPairModel import TradingPair
-from src.OrderBookRecovery.OrderBookRecoveryModel import StrategyRunTrade
+from src.OrderBookRecovery.OrderBookRecoveryModel import StrategyRunTrade, ExecutionSlot
 from src.OrderBookRecovery.OrderBookRecoveryService import OrderBookRecoveryService
 from src.OrderBookRecovery.FuturesSnapshotStore import FuturesSnapshotStore
 
@@ -87,6 +87,7 @@ def fixture_identity():
 
 @app.post('/__fixture__/legacy-position')
 def fixture_legacy():
+    body = request.get_json(silent=True) or {}
     config = service.get_or_create_config()
     if service.open_trade(config):
         return jsonify(error='fixture_requires_flat'), 409
@@ -94,6 +95,10 @@ def fixture_legacy():
     saved = service.config_to_dict(config)
     for key in ('paper_session_id', 'risk_per_trade_percent', 'max_position_margin_usdt', 'max_consecutive_losses'):
         saved.pop(key, None)
+    if body.get('missing_execution_evidence'):
+        saved.pop('paper_latency_ms', None)
+        saved.pop('paper_taker_fee_percent', None)
+        config.enabled = bool(body.get('entries_enabled', False))
     trade = StrategyRunTrade(strategy_config_id=config.id, execution_mode='paper', exchange=config.exchange,
         symbol=config.symbol, side='short', margin=7, leverage=1, notional=7, amount=.07, entry_price=100,
         pnl=0, paper_session_id=None, execution_config_json=None,
@@ -101,6 +106,10 @@ def fixture_legacy():
         paper_close_requested_at=datetime.utcnow()-timedelta(seconds=3), paper_close_reason='manual_close',
         paper_exit_status='pending_fixed_latency', opened_at=datetime.utcnow()-timedelta(minutes=5))
     db.session.add(trade)
+    db.session.flush()
+    if body.get('missing_execution_evidence'):
+        db.session.add(ExecutionSlot(strategy_config_id=config.id, trade_id=trade.id,
+            client_order_id=f'paper_fixture_{trade.id}', status='active'))
     db.session.commit()
     FuturesSnapshotStore.clear()
     return jsonify(id=trade.id, fixture=True)

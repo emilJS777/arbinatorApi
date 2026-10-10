@@ -10,8 +10,9 @@ logger = logging.getLogger(__name__)
 
 
 class LifecycleValidationError(Exception):
-    def __init__(self, code, status=409, fields=None):
+    def __init__(self, code, status=409, fields=None, details=None):
         self.code, self.status, self.fields = code, status, fields or []
+        self.details = details or {}
         super().__init__(code)
 
 
@@ -37,7 +38,7 @@ def lifecycle_endpoint(operation):
             except LifecycleValidationError as error:
                 db.session.rollback()
                 return make_response(jsonify(success=False, obj={"msg": error.code,
-                    "code": error.code, "fields": error.fields}), error.status)
+                    "code": error.code, "fields": error.fields, **error.details}), error.status)
             except HTTPException as error:
                 db.session.rollback()
                 return make_response(jsonify(success=False, obj={"msg": "invalid_request",

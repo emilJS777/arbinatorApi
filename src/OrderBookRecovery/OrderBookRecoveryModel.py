@@ -135,6 +135,8 @@ class StrategyRunTrade(Model, db.Model):
     paper_session_id = db.Column(db.String(36), db.ForeignKey("orderbook_paper_session.id"), nullable=True, index=True)
     pending_entry_expires_at = db.Column(db.DateTime, nullable=True)
     paper_exit_status = db.Column(db.String(100), nullable=True)
+    abandoned_at = db.Column(db.DateTime, nullable=True, index=True)
+    abandonment_reason = db.Column(db.String(120), nullable=True)
     strategy_config_id = db.Column(db.Integer, db.ForeignKey("order_book_pattern_strategy_config.id"), nullable=False)
     strategy_run = db.relationship("StrategyRun")
     strategy_config = db.relationship("OrderBookPatternStrategyConfig")

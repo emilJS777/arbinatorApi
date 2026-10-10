@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 
 from src import db
 from src.OrderBookRecovery.RuntimeDiagnostics import runtime_diagnostics
+from src.OrderBookRecovery.PaperAbandonment import abandonment_mode_error
 from src.OrderBookRecovery.FuturesSnapshotStore import FuturesSnapshotStore as OrderBookSnapshotStore
 from src.Exchange.ExchangeModel import Exchange
 from src.OrderBookRecovery.OrderBookRecoveryModel import (
@@ -32,6 +33,7 @@ from src.OrderBookRecovery.OrderBookRecoveryModel import (
     StrategyRunTrade,
     ExecutionSlot,
     PaperSession,
+    TradeFundingEvent,
 )
 from src.OrderBookRecovery.OrderBookNormalizer import OrderBookNormalizer
 from src.OrderBookRecovery.LiveExecutionService import LiveExecutionService, LiveExecutionError, SubmissionUnknown, OrderNotFilled
@@ -516,7 +518,7 @@ class OrderBookRecoveryService(Response):
         return float(session.initial_equity_usdt if session else config.paper_equity_usdt)
 
     def cancel_paper_entry(self, trade, reason, now, commit=True):
-        if trade.closed_at or trade.live_status != "paper_pending":
+        if trade.abandoned_at or trade.closed_at or trade.live_status != "paper_pending":
             return self.trade_to_dict(trade)
         trade.live_status, trade.result = "paper_cancelled", "cancelled"
         trade.reason_close, trade.closed_at, trade.pnl = f"pending_entry_{reason}", now, 0
@@ -710,12 +712,59 @@ class OrderBookRecoveryService(Response):
             return self.response_not_found("Forward test not found")
         return self.response_ok(self.metrics_for_run(run))
 
+    def abandon_legacy_paper(self, position_id: int, body: dict):
+        if body.get("confirm_abandon") is not True or type(body.get("position_id")) is not int or body["position_id"] != position_id:
+            raise LifecycleValidationError("abandon_confirmation_position_id_required", status=400)
+        current = self.get_or_create_config()
+        config = self.lock_config(current.id)
+        trade = StrategyRunTrade.query.filter_by(id=position_id, strategy_config_id=config.id).populate_existing().with_for_update().first()
+        if not trade:
+            return self.response_not_found("Paper position not found")
+        error = abandonment_mode_error(trade, self.parse_json)
+        if error or TradeFundingEvent.query.filter_by(trade_id=trade.id).first():
+            raise LifecycleValidationError(error or "abandon_rejected_live_execution_evidence")
+        slot = ExecutionSlot.query.filter_by(strategy_config_id=config.id, trade_id=trade.id).with_for_update().first()
+        if slot and slot.status != "active":
+            raise LifecycleValidationError("abandon_rejected_unknown_execution_slot")
+        if trade.abandoned_at:
+            return self.response_ok(self.trade_to_dict(trade))
+        if config.enabled:
+            raise LifecycleValidationError("pause_entries_before_abandon")
+        if trade.closed_at:
+            raise LifecycleValidationError("cannot_abandon_closed_position")
+        try:
+            self.trade_config(config, trade)
+        except LifecycleValidationError as review:
+            if review.code != "legacy_paper_execution_config_review_required":
+                raise
+        else:
+            raise LifecycleValidationError("abandon_requires_missing_execution_evidence")
+        now = datetime.utcnow()
+        trade.abandoned_at = now
+        trade.abandonment_reason = "legacy_paper_execution_config_review_required"
+        trade.result = "abandoned"
+        trade.live_status = "paper_abandoned"
+        trade.paper_exit_status = "abandoned_unverified"
+        trade.pending_entry_expires_at = None
+        trade.paper_close_requested_at = None
+        trade.paper_close_reason = None
+        if slot:
+            db.session.delete(slot)
+        # Keep all original price/PnL/fee evidence untouched; the DTO marks it unverified.
+        db.session.flush()
+        response = self.response_ok(self.trade_to_dict(trade))
+        db.session.commit()
+        logger.info("Legacy paper position abandoned/unverified trade_id=%s", position_id)
+        return response
+
     def close_manual(self, position_id: int, body: dict):
         config = self.get_or_create_config()
         state = self.get_or_create_state(config)
         trade = db.session.get(StrategyRunTrade, position_id)
         if not trade or trade.strategy_config_id != config.id:
             return self.response_not_found("Paper position not found")
+        if trade.abandoned_at:
+            return self.response_ok(self.trade_to_dict(trade))
         if trade.closed_at:
             if trade.execution_mode != "live":
                 return self.response_ok(self.trade_to_dict(trade))
@@ -795,6 +844,8 @@ class OrderBookRecoveryService(Response):
         trade = db.session.get(StrategyRunTrade, trade_id)
         if not trade:
             return self.response_not_found("Trade not found")
+        if trade.abandoned_at:
+            return self.response_conflict("abandoned_history_must_be_preserved")
         if not trade.is_archived:
             return self.response(False, {"msg": "cannot_delete_non_archived_trade"}, 400)
         db.session.delete(trade)
@@ -802,7 +853,7 @@ class OrderBookRecoveryService(Response):
         return self.response_ok({"deleted_trade_id": trade_id})
 
     def delete_all_archived_trades(self):
-        trades = StrategyRunTrade.query.filter_by(is_archived=True).all()
+        trades = StrategyRunTrade.query.filter_by(is_archived=True).filter(StrategyRunTrade.abandoned_at.is_(None)).all()
         deleted_count = len(trades)
         for trade in trades:
             db.session.delete(trade)
@@ -949,6 +1000,8 @@ class OrderBookRecoveryService(Response):
     def decision_details_payload(self, trade):
         ml_snapshots = MLFeatureSnapshot.query.filter_by(trade_id=trade.id).order_by(MLFeatureSnapshot.timestamp.desc()).all()
         latest_ml = self.ml_snapshot_to_dict(ml_snapshots[0]) if ml_snapshots else None
+        decision = self.parse_json(trade.decision_snapshot_json)
+        decision = decision if isinstance(decision, dict) else {}
         return {
             "trade": self.trade_to_dict(trade),
             "summary": {
@@ -958,7 +1011,9 @@ class OrderBookRecoveryService(Response):
                 "side": trade.side,
                 "entry_price": trade.entry_price,
                 "exit_price": trade.exit_price,
-                "pnl": trade.pnl,
+                "pnl": None if trade.abandoned_at else trade.pnl,
+                "abandoned_at": trade.abandoned_at,
+                "accounting_status": "abandoned_unverified" if trade.abandoned_at else "active_history",
                 "result": trade.result,
                 "opened_at": trade.opened_at,
                 "closed_at": trade.closed_at,
@@ -987,10 +1042,10 @@ class OrderBookRecoveryService(Response):
                 "configured_exchange_momentum": trade.configured_exchange_momentum or trade.signal_configured_exchange_momentum,
                 "entry_reason": trade.entry_reason or trade.reason_open,
             },
-            "consensus": (self.parse_json(trade.decision_snapshot_json) or {}).get("consensus_decision") or {},
-            "feedback": (self.parse_json(trade.decision_snapshot_json) or {}).get("feedback_state") or {},
-            "risk": (self.parse_json(trade.decision_snapshot_json) or {}).get("risk_decision") or {},
-            "ml": latest_ml or (self.parse_json(trade.decision_snapshot_json) or {}).get("ml_prediction") or {},
+            "consensus": decision.get("consensus_decision") or {},
+            "feedback": decision.get("feedback_state") or {},
+            "risk": decision.get("risk_decision") or {},
+            "ml": latest_ml or decision.get("ml_prediction") or {},
             "ml_snapshots": [self.ml_snapshot_to_dict(snapshot) for snapshot in ml_snapshots],
         }
 
@@ -3531,11 +3586,11 @@ class OrderBookRecoveryService(Response):
         return payload
 
     def evaluate_open_trade(self, trade, current_price: float, state, config, current_time):
-        if trade.execution_mode == "paper":
+        if trade.execution_mode != "live":
             active_config = self.lock_config(trade.strategy_config_id)
             db.session.refresh(trade)
             db.session.refresh(state)
-            if trade.closed_at:
+            if trade.abandoned_at or trade.closed_at:
                 return self.trade_to_dict(trade)
         if trade.execution_mode == "live" and trade.live_status in {"open_pending", "open_unknown", "close_pending", "close_unknown"}:
             return self.reconcile_pending_trade(trade, config, state, current_time)
@@ -3647,6 +3702,7 @@ class OrderBookRecoveryService(Response):
         """Read exchange state even when entry scanning is stopped or books are unavailable."""
         self.__class__._paper_worker_heartbeat = datetime.utcnow()
         paper_trades = StrategyRunTrade.query.filter(
+            StrategyRunTrade.abandoned_at.is_(None),
             or_(StrategyRunTrade.execution_mode == "paper", StrategyRunTrade.execution_mode.is_(None)), StrategyRunTrade.closed_at.is_(None),
             or_(StrategyRunTrade.live_status.is_(None), StrategyRunTrade.live_status != "paper_pending")).all()
         for trade in paper_trades:
@@ -3654,7 +3710,7 @@ class OrderBookRecoveryService(Response):
             try:
                 config = self.lock_config(trade.strategy_config_id)
                 db.session.refresh(trade)
-                if trade.closed_at:
+                if trade.abandoned_at or trade.closed_at:
                     db.session.commit()
                     continue
                 frozen = self.trade_config(config, trade)
@@ -3789,6 +3845,8 @@ class OrderBookRecoveryService(Response):
         if trade.execution_mode != "live":
             self.lock_config(trade.strategy_config_id)
             db.session.refresh(trade)
+            if trade.abandoned_at:
+                return self.trade_to_dict(trade)
             if trade.live_status == "paper_pending":
                 return self.cancel_paper_entry(trade, "manual_cancel", current_time)
         if trade.closed_at:
@@ -3846,7 +3904,7 @@ class OrderBookRecoveryService(Response):
         if trade.execution_mode != "live":
             self.lock_config(trade.strategy_config_id)
             db.session.refresh(trade)
-            if trade.closed_at:
+            if trade.abandoned_at or trade.closed_at:
                 return self.trade_to_dict(trade)
             fill = self.paper_fill(self.snapshot_for(trade.exchange, trade.symbol), "short" if trade.side == "long" else "long", trade.amount, config, current_time,
                 trade.paper_close_requested_at + timedelta(milliseconds=config.paper_latency_ms) if trade.paper_close_requested_at and config.paper_latency_ms else None, protective=True)
@@ -3943,6 +4001,7 @@ class OrderBookRecoveryService(Response):
 
     def open_trade(self, config):
         return StrategyRunTrade.query.filter(
+            StrategyRunTrade.abandoned_at.is_(None),
             StrategyRunTrade.strategy_config_id == config.id,
             StrategyRunTrade.closed_at.is_(None),
             or_(StrategyRunTrade.live_status.is_(None), StrategyRunTrade.live_status != "open_failed"),
@@ -3965,6 +4024,7 @@ class OrderBookRecoveryService(Response):
 
     def open_positions_count(self, config):
         return StrategyRunTrade.query.filter(
+            StrategyRunTrade.abandoned_at.is_(None),
             StrategyRunTrade.strategy_config_id == config.id,
             StrategyRunTrade.closed_at.is_(None),
             or_(StrategyRunTrade.live_status.is_(None), StrategyRunTrade.live_status != "open_failed"),
@@ -3974,7 +4034,7 @@ class OrderBookRecoveryService(Response):
         return StrategyRun.query.filter_by(strategy_config_id=config.id, status="running").order_by(StrategyRun.id.desc()).first()
 
     def closed_trades_query(self, config=None):
-        query = StrategyRunTrade.query.filter(StrategyRunTrade.closed_at.isnot(None))
+        query = StrategyRunTrade.query.filter(StrategyRunTrade.closed_at.isnot(None), StrategyRunTrade.abandoned_at.is_(None))
         if config:
             query = query.filter_by(strategy_config_id=config.id)
         return query
@@ -4023,7 +4083,7 @@ class OrderBookRecoveryService(Response):
 
     def metrics_for_run(self, run):
         config = db.session.get(OrderBookPatternStrategyConfig, run.strategy_config_id)
-        live_not_failed = or_(StrategyRunTrade.live_status.is_(None), StrategyRunTrade.live_status.notin_(["open_failed", "paper_cancelled"]))
+        live_not_failed = or_(StrategyRunTrade.live_status.is_(None), StrategyRunTrade.live_status.notin_(["open_failed", "paper_cancelled", "paper_abandoned"]))
         trades = StrategyRunTrade.query.filter(
             StrategyRunTrade.strategy_run_id == run.id,
             StrategyRunTrade.is_archived.is_(False),
@@ -4036,13 +4096,17 @@ class OrderBookRecoveryService(Response):
         ).all()
         open_trade = StrategyRunTrade.query.filter(
             StrategyRunTrade.strategy_run_id == run.id,
+            StrategyRunTrade.abandoned_at.is_(None),
             StrategyRunTrade.closed_at.is_(None),
             live_not_failed,
         ).first()
         return self.calculate_metrics(trades, config.paper_equity_usdt if config else 10000, open_trade, archived_trades)
 
     def calculate_metrics(self, trades, initial_equity, open_trade=None, archived_trades=None):
-        archived_trades = archived_trades or []
+        trades = [trade for trade in trades if not getattr(trade, "abandoned_at", None)]
+        archived_trades = [trade for trade in (archived_trades or []) if not getattr(trade, "abandoned_at", None)]
+        if open_trade and getattr(open_trade, "abandoned_at", None):
+            open_trade = None
         trades = sorted(trades, key=lambda trade: (trade.closed_at or trade.opened_at, trade.id))
         pnls = [trade.pnl for trade in trades]
         wins = [pnl for pnl in pnls if pnl > 0]
@@ -4110,6 +4174,12 @@ class OrderBookRecoveryService(Response):
                     getattr(self.__class__, "_paper_worker_heartbeat", None))
             except LifecycleValidationError as error:
                 paper_exit = {"exit_block_reason": error.code, "missing_fields": error.fields}
+                paper_exit["abandon_allowed"] = (error.code == "legacy_paper_execution_config_review_required" and
+                    abandonment_mode_error(open_trade, self.parse_json) is None and
+                    not TradeFundingEvent.query.filter_by(trade_id=open_trade.id).first())
+                slot = db.session.get(ExecutionSlot, config.id)
+                if slot and slot.trade_id == open_trade.id and slot.status != "active":
+                    paper_exit["abandon_allowed"] = False
         latest_snapshot = self.latest_snapshot_for(config)
         margin_limit = self.live_execution_service.margin_limit_debug(
             config,
@@ -4266,6 +4336,9 @@ class OrderBookRecoveryService(Response):
         if not trade:
             return None
         return {
+            "abandoned_at": trade.abandoned_at,
+            "abandonment_reason": trade.abandonment_reason,
+            "accounting_status": "abandoned_unverified" if trade.abandoned_at else "active_history",
             "paper_session_id": trade.paper_session_id,
             "pending_entry_expires_at": trade.pending_entry_expires_at,
             "paper_exit_status": trade.paper_exit_status,
@@ -4281,7 +4354,7 @@ class OrderBookRecoveryService(Response):
             "amount": trade.amount,
             "entry_price": trade.entry_price,
             "exit_price": trade.exit_price,
-            "pnl": trade.pnl,
+            "pnl": None if trade.abandoned_at else trade.pnl,
             "result": trade.result,
             "recovery_step": trade.recovery_step,
             "reason_open": trade.reason_open,
@@ -4343,9 +4416,9 @@ class OrderBookRecoveryService(Response):
             "live_error": trade.live_error,
             "live_raw_open_response_json": trade.live_raw_open_response_json,
             "live_raw_close_response_json": trade.live_raw_close_response_json,
-            "gross_pnl": trade.gross_pnl,
-            "net_pnl": trade.net_pnl,
-            "total_fee": trade.total_fee,
+            "gross_pnl": None if trade.abandoned_at else trade.gross_pnl,
+            "net_pnl": None if trade.abandoned_at else trade.net_pnl,
+            "total_fee": None if trade.abandoned_at else trade.total_fee,
             "exchange_tp_order_id": trade.exchange_tp_order_id,
             "exchange_sl_order_id": trade.exchange_sl_order_id,
             "exchange_tp_price": trade.exchange_tp_price,

@@ -83,6 +83,8 @@ api.add_resource(OrderBookRecoveryForwardTestController, "/api/orderbook-recover
 api.add_resource(OrderBookRecoveryForwardTestItemController, "/api/orderbook-recovery/forward-tests/<int:run_id>")
 api.add_resource(OrderBookRecoveryForwardTestMetricsController, "/api/orderbook-recovery/forward-tests/<int:run_id>/metrics")
 api.add_resource(OrderBookRecoveryManualCloseController, "/api/orderbook-recovery/positions/<int:position_id>/close-manual")
+from src.OrderBookRecovery.OrderBookRecoveryController import OrderBookRecoveryAbandonPaperController
+api.add_resource(OrderBookRecoveryAbandonPaperController, "/api/orderbook-recovery/positions/<int:position_id>/abandon-legacy-paper")
 api.add_resource(OrderBookRecoveryTradeArchiveController, "/api/orderbook-recovery/trades/<int:trade_id>/archive")
 api.add_resource(OrderBookRecoveryTradeDeleteArchivedController, "/api/orderbook-recovery/trades/<int:trade_id>/delete-archived")
 api.add_resource(OrderBookRecoveryDeleteAllArchivedController, "/api/orderbook-recovery/trades/delete-all-archived")

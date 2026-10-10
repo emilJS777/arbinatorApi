@@ -9,6 +9,7 @@ class SignalFeedbackService:
     def recent_trades(self, config, side=None, limit=None):
         query = StrategyRunTrade.query.filter(
             StrategyRunTrade.strategy_config_id == config.id,
+            StrategyRunTrade.abandoned_at.is_(None),
             StrategyRunTrade.closed_at.isnot(None),
             StrategyRunTrade.is_archived.is_(False),
             StrategyRunTrade.execution_mode == config.execution_mode,

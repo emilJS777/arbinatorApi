@@ -29,6 +29,14 @@ class OrderBookRecoveryOptionsController(Controller):
         return self.service.options_response()
 
 
+class OrderBookRecoveryAbandonPaperController(Controller):
+    service = OrderBookRecoveryService()
+
+    @lifecycle_endpoint("abandon_paper")
+    def post(self, position_id):
+        return self.service.abandon_legacy_paper(position_id, self.request.get_json() or {})
+
+
 class OrderBookRecoveryStartController(Controller):
     service = OrderBookRecoveryService()
 

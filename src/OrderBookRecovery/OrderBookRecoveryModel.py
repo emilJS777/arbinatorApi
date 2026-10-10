@@ -7,6 +7,9 @@ from src.__Parents.Model import Model
 class OrderBookPatternStrategyConfig(Model, db.Model):
     __tablename__ = "order_book_pattern_strategy_config"
 
+    strategy_version = db.Column(db.String(40), default="baseline", nullable=False)
+    experiment_settings = db.Column(db.JSON, nullable=True)
+
     exchange = db.Column(db.String(80), default="binance", nullable=False)
     symbol = db.Column(db.String(40), default="BTC/USDT", nullable=False)
     exchange_id = db.Column(db.Integer, db.ForeignKey("exchange.id"), nullable=True)

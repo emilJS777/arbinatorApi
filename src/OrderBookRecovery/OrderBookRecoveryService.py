@@ -18,6 +18,7 @@ from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 
 from src import db
+from src.OrderBookRecovery.AdaptiveBookV1 import AdaptiveBookV1, VERSION as EXPERIMENT_VERSION, settings as experiment_settings, exit_decision
 from src.OrderBookRecovery.RuntimeDiagnostics import runtime_diagnostics
 from src.OrderBookRecovery.PaperAbandonment import abandonment_mode_error
 from src.OrderBookRecovery.FuturesSnapshotStore import FuturesSnapshotStore as OrderBookSnapshotStore
@@ -189,6 +190,7 @@ class OrderBookRecoveryService(Response):
 
     def apply_config_overrides(self, config, overrides: dict):
         allowed = {
+            "strategy_version", "experiment_settings",
             "exchange",
             "symbol",
             "base_margin_usdt",
@@ -261,6 +263,11 @@ class OrderBookRecoveryService(Response):
         for key in allowed:
             if key in overrides:
                 setattr(config, key, overrides[key])
+        if config.strategy_version not in {"baseline", EXPERIMENT_VERSION}:
+            raise ValueError("invalid_strategy_version")
+        config.experiment_settings = experiment_settings(config.experiment_settings)
+        if config.strategy_version == EXPERIMENT_VERSION and config.execution_mode != "paper":
+            raise ValueError("invalid_experimental_paper_only")
         if config.entry_mode not in {"instant", "two_step_confirmation"}:
             config.entry_mode = "instant"
         if config.execution_mode not in {"paper", "live"}:
@@ -291,6 +298,10 @@ class OrderBookRecoveryService(Response):
 
     def update_config(self, body: dict):
         config = self.lock_config(self.get_or_create_config().id)
+        try:
+            experiment_settings(body.get("experiment_settings", config.experiment_settings))
+        except ValueError as error:
+            return self.validation_error(str(error))
         for key, value in body.items():
             column = OrderBookPatternStrategyConfig.__table__.columns.get(key)
             if column is not None and not column.nullable and value is None:
@@ -315,11 +326,12 @@ class OrderBookRecoveryService(Response):
         if error:
             return self.validation_error(error)
         proposed = {key: body.get(key, getattr(config, key)) for key in
-                    ("exchange", "symbol", "exchange_id", "trading_pair_id", "execution_mode")}
+                    ("exchange", "symbol", "exchange_id", "trading_pair_id", "execution_mode", "strategy_version", "experiment_settings")}
         if exchange and trading_pair:
             proposed.update(exchange=exchange.title, symbol=trading_pair.pair,
                             exchange_id=exchange.id, trading_pair_id=trading_pair.id)
-        changed = any(proposed[key] != getattr(config, key) for key in proposed)
+        changed = any((experiment_settings(proposed[key]) != experiment_settings(getattr(config, key)))
+                      if key == "experiment_settings" else proposed[key] != getattr(config, key) for key in proposed)
         if changed and (self.open_trade(config) or db.session.get(ExecutionSlot, config.id)
                         or self.__class__._pending_entries.get(self.pending_key(config))):
             return self.validation_error("cannot_change_execution_config_with_open_position")
@@ -412,6 +424,8 @@ class OrderBookRecoveryService(Response):
         return response
 
     def live_start_rejection(self, config):
+        if getattr(config, "strategy_version", "baseline") == EXPERIMENT_VERSION:
+            return "experimental_paper_only"
         state = self.get_or_create_state(config, commit=False)
         reason = self.live_execution_service.validate_enabled(config, state.current_margin or config.base_margin_usdt)
         if reason:
@@ -454,6 +468,7 @@ class OrderBookRecoveryService(Response):
         )
 
     def stop(self, reason="manual_stop"):
+        AdaptiveBookV1.reset(self.get_or_create_config().id)
         config = self.get_or_create_config()
         config = self.lock_config(config.id)
         config.enabled = False
@@ -1136,11 +1151,16 @@ class OrderBookRecoveryService(Response):
                 if row.get("valid"):
                     return self.evaluate_open_trade(open_trade, row["mid_price"], state, frozen, current_time)
             if open_trade.execution_mode == "paper":
+                if (getattr(frozen, "strategy_version", "baseline") == EXPERIMENT_VERSION
+                        and (current_time - open_trade.opened_at).total_seconds() >= experiment_settings(frozen.experiment_settings)["max_hold_seconds"]):
+                    return self.close_trade(open_trade, open_trade.entry_price, open_trade.pnl,
+                        open_trade.paper_close_reason or "experimental_max_hold", state, frozen, current_time)
                 open_trade.paper_exit_status = "unresolved_no_fresh_valid_book"
                 db.session.commit()
             return self.trade_to_dict(open_trade)
 
         if not config.enabled or state.is_stopped:
+            AdaptiveBookV1.reset(config.id)
             reason = self.reason_if_not_trading(config, state)
             self.observe_signal("inactive", reason)
             self.store_last_evaluation(config, reject_reason=reason, evaluated_at=current_time)
@@ -1149,6 +1169,7 @@ class OrderBookRecoveryService(Response):
 
         snapshot = snapshot or self.snapshot_for(config.exchange, config.symbol)
         if not snapshot:
+            AdaptiveBookV1.reset(config.id)
             self.observe_signal("snapshot_rejected", "no_valid_order_book_snapshot")
             self.store_last_evaluation(config, reject_reason="no_valid_order_book_snapshot", evaluated_at=current_time)
             self.record_signal_diagnostic(config, reject_reason="no_valid_order_book_snapshot", evaluated_at=current_time)
@@ -2917,7 +2938,7 @@ class OrderBookRecoveryService(Response):
             if isinstance(source_time, (int, float)):
                 source_time = datetime.utcfromtimestamp(source_time / 1000 if source_time > 1e11 else source_time)
             age = max(age or 0, max(0, (current_time - source_time).total_seconds()))
-            if source_time > current_time + timedelta(seconds=0 if protective else 1):
+            if source_time > current_time + timedelta(seconds=0 if protective or getattr(config, "strategy_version", "baseline") == EXPERIMENT_VERSION else 1):
                 error = "future_snapshot_timestamp"
         source_snapshot_time = snapshot.get("updated_at")
         item = {
@@ -3055,6 +3076,7 @@ class OrderBookRecoveryService(Response):
     def signal(self, config, state, features, current_time, pending_trade_id=None):
         risk_reason = self.risk_rejection(config, state, features, current_time, pending_trade_id)
         if risk_reason:
+            AdaptiveBookV1.reset(config.id)
             self.observe_signal("risk_rejected", risk_reason)
             consensus = self.consensus_snapshot(config, current_time) if config.consensus_enabled else {"per_exchange_features": []}
             consensus["reject_reason"] = risk_reason
@@ -3074,7 +3096,14 @@ class OrderBookRecoveryService(Response):
         if config.consensus_enabled:
             side, consensus = self.consensus_signal(config, current_time)
             self.observe_signal("consensus_passed" if side else "consensus_rejected", consensus.get("reject_reason"), consensus)
+            if getattr(config, "strategy_version", "baseline") == EXPERIMENT_VERSION:
+                side, report = AdaptiveBookV1.entry(config, side, consensus, self.snapshot_for(config.exchange, config.symbol), current_time, self.bounded_margin(config, current_time))
+                consensus["experiment"] = report
+                consensus["reject_reason"] = report.get("reject_reason")
+                self.observe_signal("experiment_passed" if side else "experiment_rejected", report.get("reject_reason"), report)
             return side, consensus
+        if getattr(config, "strategy_version", "baseline") == EXPERIMENT_VERSION:
+            return None, {"reject_reason": "experimental_cross_exchange_required"}
         if features["imbalance"] > config.long_imbalance_threshold and features["short_momentum"] > 0:
             self.observe_signal("consensus_passed", details={"side": "long", "consensus_disabled": True})
             return "long", {}
@@ -3365,6 +3394,7 @@ class OrderBookRecoveryService(Response):
         target_profit = margin * (float(config.take_profit_percent_of_margin) / 100)
         max_loss = margin * (float(config.stop_loss_percent_of_margin) / 100)
         return {
+            "experiment": consensus.get("experiment"),
             "config": self.config_to_dict(config),
             "timestamp": current_time,
             "selected_side": side,
@@ -3416,6 +3446,8 @@ class OrderBookRecoveryService(Response):
         }
 
     def open_position(self, config, state, features, side, current_time, consensus=None, entry_context=None):
+        if getattr(config, "strategy_version", "baseline") == EXPERIMENT_VERSION and config.execution_mode != "paper":
+            return self.reject("experimental_paper_only", config, state)
         if config.execution_mode == "paper":
             config = self.lock_config(config.id)
             db.session.refresh(state)
@@ -3423,6 +3455,11 @@ class OrderBookRecoveryService(Response):
                 return self.reject("entries_paused", config, state)
             if not config.paper_session_id:
                 self.create_paper_session(config)
+            if getattr(config, "strategy_version", "baseline") == EXPERIMENT_VERSION:
+                checked_side, checked = self.signal(config, state, features, current_time)
+                if checked_side != side:
+                    return self.reject(checked.get("reject_reason") or "experimental_signal_changed", config, state)
+                consensus = {**(consensus or {}), **checked}
         previous_slot = db.session.get(ExecutionSlot, config.id)
         if previous_slot:
             previous_trade = db.session.get(StrategyRunTrade, previous_slot.trade_id)
@@ -3706,6 +3743,9 @@ class OrderBookRecoveryService(Response):
                     if indicated <= -trade.margin * float(config.stop_loss_percent_of_margin) / 100:
                         # Latch a stop intent, never book an indicative price as a fill.
                         return self.close_trade(trade, quote, indicated, "stop_loss", state, config, current_time)
+                if (getattr(config, "strategy_version", "baseline") == EXPERIMENT_VERSION
+                        and (current_time - trade.opened_at).total_seconds() >= experiment_settings(config.experiment_settings)["max_hold_seconds"]):
+                    return self.close_trade(trade, current_price, pnl, "experimental_max_hold", state, config, current_time)
                 db.session.commit()
                 return None
             trade.paper_exit_status = None
@@ -3717,6 +3757,24 @@ class OrderBookRecoveryService(Response):
             return self.close_trade(trade, current_price, pnl, "take_profit", state, config, current_time)
         if pnl <= -max_loss:
             return self.close_trade(trade, current_price, pnl, "stop_loss", state, config, current_time)
+        if trade.execution_mode == "paper" and getattr(config, "strategy_version", "baseline") == EXPERIMENT_VERSION:
+            if (current_time - trade.opened_at).total_seconds() >= experiment_settings(config.experiment_settings)["max_hold_seconds"]:
+                return self.close_trade(trade, current_price, pnl, "experimental_max_hold", state, config, current_time)
+            direction, consensus = self.consensus_signal(config, current_time)
+            snapshot = self.snapshot_for(trade.exchange, trade.symbol) or {}
+            source = snapshot.get("metadata", {}).get("source_timestamp")
+            if isinstance(source, (int, float)):
+                source = datetime.utcfromtimestamp(source / 1000 if source > 1e11 else source)
+            decision = self.parse_json(trade.decision_snapshot_json) or {}
+            # Unavailable confirmation is not evidence of an observed reversal.
+            if consensus.get("configured_exchange_valid") and consensus.get("valid_exchanges_count", 0) >= config.min_valid_exchanges:
+                reason, monitor = exit_decision(config.experiment_settings, decision.get("experiment_exit_state"), trade.side,
+                    direction, source, current_time, trade.opened_at, pnl, trade.margin)
+                decision["experiment_exit_state"] = monitor
+                trade.decision_snapshot_json = json.dumps(decision, default=str)
+                if reason:
+                    logger.info("Paper experiment exit requested trade_id=%s reason=%s", trade.id, reason)
+                    return self.close_trade(trade, current_price, pnl, reason, state, config, current_time)
         db.session.commit()
         return None
 
@@ -4248,6 +4306,8 @@ class OrderBookRecoveryService(Response):
 
     def config_to_dict(self, config):
         return {
+            "strategy_version": getattr(config, "strategy_version", "baseline"),
+            "experiment_settings": experiment_settings(getattr(config, "experiment_settings", None)),
             "paper_session_id": config.paper_session_id,
             "pending_entry_ttl_seconds": config.pending_entry_ttl_seconds,
             "risk_per_trade_percent": config.risk_per_trade_percent,

@@ -277,13 +277,23 @@ class OrderBookRecoveryService(Response):
         config.max_leverage = min(10, max(1, float(config.max_leverage)))
 
     def update_config(self, body: dict):
-        config = self.get_or_create_config()
-        if self.open_trade(config) and any(key in body for key in ("exchange", "symbol", "exchange_id", "trading_pair_id", "execution_mode")):
-            return self.validation_error("cannot_change_execution_config_with_open_position")
+        config = self.lock_config(self.get_or_create_config().id)
+        if "emergency_entry_block" in body and not isinstance(body["emergency_entry_block"], bool):
+            return self.validation_error("invalid_emergency_entry_block")
         logger.info("OrderBookRecovery config PATCH received keys=%s ml_mode=%s", sorted(body.keys()), body.get("ml_mode"))
         exchange, trading_pair, error = self.resolve_config_selection(body)
         if error:
             return self.validation_error(error)
+        proposed = {key: body.get(key, getattr(config, key)) for key in
+                    ("exchange", "symbol", "exchange_id", "trading_pair_id", "execution_mode")}
+        if exchange and trading_pair:
+            proposed.update(exchange=exchange.title, symbol=trading_pair.pair,
+                            exchange_id=exchange.id, trading_pair_id=trading_pair.id)
+        changed = any(proposed[key] != getattr(config, key) for key in proposed)
+        if changed and (self.open_trade(config) or db.session.get(ExecutionSlot, config.id)
+                        or self.__class__._pending_entries.get(self.pending_key(config))):
+            return self.validation_error("cannot_change_execution_config_with_open_position")
+        block_changed = "emergency_entry_block" in body and body["emergency_entry_block"] != config.emergency_entry_block
         self.apply_config_overrides(config, body)
         logger.info("OrderBookRecovery config after overrides id=%s ml_mode=%s", config.id, config.ml_mode)
         if exchange and trading_pair:
@@ -293,8 +303,19 @@ class OrderBookRecoveryService(Response):
             config.symbol = trading_pair.pair
         if "enabled" in body:
             config.enabled = body["enabled"]
+        if block_changed:
+            # Changing an emergency gate never implicitly starts entries, even in a full-form PATCH.
+            config.enabled = False
+        if config.emergency_entry_block:
+            config.enabled = False
+            for trade in StrategyRunTrade.query.filter_by(strategy_config_id=config.id, execution_mode="paper", live_status="paper_pending", closed_at=None).all():
+                self.cancel_paper_entry(trade, "emergency_entry_block", datetime.utcnow(), commit=False)
+            self.clear_pending_entry(config, "cancelled", "emergency_entry_block")
         config.paper_mode_only = True
         state = self.get_or_create_state(config)
+        if block_changed:
+            state.is_stopped = True
+            state.stop_reason = "emergency_entry_block" if config.emergency_entry_block else "manual_stop"
         if state.current_margin <= 0:
             state.current_margin = config.base_margin_usdt
         db.session.commit()
@@ -3765,7 +3786,14 @@ class OrderBookRecoveryService(Response):
         db.session.commit()
         payload = self.trade_to_dict(trade)
         logger.info("OrderBookRecovery position closed: trade_id=%s reason=%s pnl=%s", trade.id, reason, pnl)
-        self.publisher.publish("orderbook_recovery.position_closed", payload)
+        if trade.execution_mode == "paper":
+            try:
+                self.publisher.publish("orderbook_recovery.position_closed", payload)
+            except Exception as error:
+                # The fill is already committed. A notification failure is not a failed close.
+                logger.warning("Paper close notification failed trade_id=%s error_class=%s", trade.id, type(error).__name__)
+        else:
+            self.publisher.publish("orderbook_recovery.position_closed", payload)
         return payload
 
     def apply_recovery_after_close(self, state, config, result, current_time=None):

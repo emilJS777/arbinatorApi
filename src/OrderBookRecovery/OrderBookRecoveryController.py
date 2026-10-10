@@ -1,5 +1,10 @@
 from src.OrderBookRecovery.OrderBookRecoveryService import OrderBookRecoveryService
 from src.__Parents.Controller import Controller
+import logging
+import traceback
+from uuid import uuid4
+from src import db
+from flask import jsonify, make_response
 
 
 class OrderBookRecoveryConfigController(Controller):
@@ -123,7 +128,20 @@ class OrderBookRecoveryManualCloseController(Controller):
     service = OrderBookRecoveryService()
 
     def post(self, position_id: int):
-        return self.service.close_manual(position_id, self.request.get_json() or {})
+        body = self.request.get_json() or {}
+        try:
+            return self.service.close_manual(position_id, body)
+        except Exception as error:
+            db.session.rollback()
+            incident_id = uuid4().hex
+            # No SQL parameters, payloads, credentials or exception message in this diagnostic.
+            frames = [{"file": frame.filename, "line": frame.lineno, "function": frame.name}
+                      for frame in traceback.extract_tb(error.__traceback__)]
+            logging.getLogger(__name__).error(
+                "paper/live close failed incident_id=%s position_id=%s error_class=%s traceback=%s",
+                incident_id, position_id, type(error).__name__, frames)
+            return make_response(jsonify(success=False, obj={"msg": "close_failed_internal",
+                "incident_id": incident_id, "position_id": position_id}), 500)
 
 
 class OrderBookRecoveryTradeArchiveController(Controller):

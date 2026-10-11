@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from src import db
 from src.OrderBookRecovery.AdaptiveBookV1 import AdaptiveBookV1, VERSION as EXPERIMENT_VERSION, settings as experiment_settings, exit_decision
 from src.OrderBookRecovery.AdaptiveBookV2 import AdaptiveBookV2, VERSION as CANDIDATE_VERSION, exit_decision as candidate_exit
+from src.OrderBookRecovery.PaperEntryMeasurement import observe as observe_entry_quality
 EXPERIMENT_VERSIONS = {EXPERIMENT_VERSION, CANDIDATE_VERSION}
 from src.OrderBookRecovery.RuntimeDiagnostics import runtime_diagnostics
 from src.OrderBookRecovery.PaperAbandonment import abandonment_mode_error
@@ -3780,6 +3781,12 @@ class OrderBookRecoveryService(Response):
             decision = decision if isinstance(decision, dict) else {}
             stats = decision.get("observed_excursions") or {}
             stats = stats if isinstance(stats, dict) else {}
+            if getattr(config, "strategy_version", "baseline") in EXPERIMENT_VERSIONS:
+                decision["entry_quality_measurement"] = observe_entry_quality(
+                    decision.get("entry_quality_measurement"), source=observed,
+                    now=current_time, opened_at=trade.opened_at, gross=pnl,
+                    entry_fee=trade.live_entry_fee, exit_fee=fill["fee"])
+                trade.decision_snapshot_json = json.dumps(decision, default=str)
             if isinstance(observed, datetime) and str(observed) != stats.get("last_source_time"):
                 stats.update(last_source_time=str(observed), samples=stats.get("samples", 0) + 1,
                     mfe_gross_usdt=max(stats.get("mfe_gross_usdt", 0), pnl),

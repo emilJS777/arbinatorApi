@@ -19,6 +19,8 @@ from sqlalchemy.exc import IntegrityError
 
 from src import db
 from src.OrderBookRecovery.AdaptiveBookV1 import AdaptiveBookV1, VERSION as EXPERIMENT_VERSION, settings as experiment_settings, exit_decision
+from src.OrderBookRecovery.AdaptiveBookV2 import AdaptiveBookV2, VERSION as CANDIDATE_VERSION, exit_decision as candidate_exit
+EXPERIMENT_VERSIONS = {EXPERIMENT_VERSION, CANDIDATE_VERSION}
 from src.OrderBookRecovery.RuntimeDiagnostics import runtime_diagnostics
 from src.OrderBookRecovery.PaperAbandonment import abandonment_mode_error
 from src.OrderBookRecovery.FuturesSnapshotStore import FuturesSnapshotStore as OrderBookSnapshotStore
@@ -263,10 +265,10 @@ class OrderBookRecoveryService(Response):
         for key in allowed:
             if key in overrides:
                 setattr(config, key, overrides[key])
-        if config.strategy_version not in {"baseline", EXPERIMENT_VERSION}:
+        if config.strategy_version not in {"baseline", *EXPERIMENT_VERSIONS}:
             raise ValueError("invalid_strategy_version")
         config.experiment_settings = experiment_settings(config.experiment_settings)
-        if config.strategy_version == EXPERIMENT_VERSION and config.execution_mode != "paper":
+        if config.strategy_version in EXPERIMENT_VERSIONS and config.execution_mode != "paper":
             raise ValueError("invalid_experimental_paper_only")
         if config.entry_mode not in {"instant", "two_step_confirmation"}:
             config.entry_mode = "instant"
@@ -424,7 +426,7 @@ class OrderBookRecoveryService(Response):
         return response
 
     def live_start_rejection(self, config):
-        if getattr(config, "strategy_version", "baseline") == EXPERIMENT_VERSION:
+        if getattr(config, "strategy_version", "baseline") in EXPERIMENT_VERSIONS:
             return "experimental_paper_only"
         state = self.get_or_create_state(config, commit=False)
         reason = self.live_execution_service.validate_enabled(config, state.current_margin or config.base_margin_usdt)
@@ -469,6 +471,7 @@ class OrderBookRecoveryService(Response):
 
     def stop(self, reason="manual_stop"):
         AdaptiveBookV1.reset(self.get_or_create_config().id)
+        AdaptiveBookV2.reset(self.get_or_create_config().id)
         config = self.get_or_create_config()
         config = self.lock_config(config.id)
         config.enabled = False
@@ -1159,7 +1162,7 @@ class OrderBookRecoveryService(Response):
                 if row.get("valid"):
                     return self.evaluate_open_trade(open_trade, row["mid_price"], state, frozen, current_time)
             if open_trade.execution_mode == "paper":
-                if (getattr(frozen, "strategy_version", "baseline") == EXPERIMENT_VERSION
+                if (getattr(frozen, "strategy_version", "baseline") in EXPERIMENT_VERSIONS
                         and (current_time - open_trade.opened_at).total_seconds() >= experiment_settings(frozen.experiment_settings)["max_hold_seconds"]):
                     return self.close_trade(open_trade, open_trade.entry_price, open_trade.pnl,
                         open_trade.paper_close_reason or "experimental_max_hold", state, frozen, current_time)
@@ -2946,7 +2949,7 @@ class OrderBookRecoveryService(Response):
             if isinstance(source_time, (int, float)):
                 source_time = datetime.utcfromtimestamp(source_time / 1000 if source_time > 1e11 else source_time)
             age = max(age or 0, max(0, (current_time - source_time).total_seconds()))
-            if source_time > current_time + timedelta(seconds=0 if protective or getattr(config, "strategy_version", "baseline") == EXPERIMENT_VERSION else 1):
+            if source_time > current_time + timedelta(seconds=0 if protective or getattr(config, "strategy_version", "baseline") in EXPERIMENT_VERSIONS else 1):
                 error = "future_snapshot_timestamp"
         source_snapshot_time = snapshot.get("updated_at")
         item = {
@@ -3062,6 +3065,9 @@ class OrderBookRecoveryService(Response):
         allowed, adaptive = self.feedback_service.evaluate(config, signal, consensus, current_time)
         return {
             "feedback_enabled": summary["feedback_enabled"],
+            "enforcement": adaptive,
+            "runtime_consecutive_losses": self.get_or_create_state(config).consecutive_losses,
+            "max_consecutive_losses": config.max_consecutive_losses,
             "long_recent_win_rate": summary["long"]["win_rate"],
             "short_recent_win_rate": summary["short"]["win_rate"],
             "long_loss_streak": summary["long"]["loss_streak"],
@@ -3104,13 +3110,18 @@ class OrderBookRecoveryService(Response):
         if config.consensus_enabled:
             side, consensus = self.consensus_signal(config, current_time)
             self.observe_signal("consensus_passed" if side else "consensus_rejected", consensus.get("reject_reason"), consensus)
-            if getattr(config, "strategy_version", "baseline") == EXPERIMENT_VERSION:
-                side, report = AdaptiveBookV1.entry(config, side, consensus, self.snapshot_for(config.exchange, config.symbol), current_time, self.bounded_margin(config, current_time))
+            if getattr(config, "strategy_version", "baseline") in EXPERIMENT_VERSIONS:
+                args = (config, side, consensus, self.snapshot_for(config.exchange, config.symbol), current_time, self.bounded_margin(config, current_time))
+                if config.strategy_version == CANDIDATE_VERSION:
+                    previous = self.closed_trades_query(config).filter_by(execution_mode="paper", paper_session_id=config.paper_session_id).order_by(StrategyRunTrade.closed_at.desc()).first()
+                    side, report = AdaptiveBookV2.entry(*args, previous=previous)
+                else:
+                    side, report = AdaptiveBookV1.entry(*args)
                 consensus["experiment"] = report
                 consensus["reject_reason"] = report.get("reject_reason")
                 self.observe_signal("experiment_passed" if side else "experiment_rejected", report.get("reject_reason"), report)
             return side, consensus
-        if getattr(config, "strategy_version", "baseline") == EXPERIMENT_VERSION:
+        if getattr(config, "strategy_version", "baseline") in EXPERIMENT_VERSIONS:
             return None, {"reject_reason": "experimental_cross_exchange_required"}
         if features["imbalance"] > config.long_imbalance_threshold and features["short_momentum"] > 0:
             self.observe_signal("consensus_passed", details={"side": "long", "consensus_disabled": True})
@@ -3454,7 +3465,7 @@ class OrderBookRecoveryService(Response):
         }
 
     def open_position(self, config, state, features, side, current_time, consensus=None, entry_context=None):
-        if getattr(config, "strategy_version", "baseline") == EXPERIMENT_VERSION and config.execution_mode != "paper":
+        if getattr(config, "strategy_version", "baseline") in EXPERIMENT_VERSIONS and config.execution_mode != "paper":
             return self.reject("experimental_paper_only", config, state)
         if config.execution_mode == "paper":
             config = self.lock_config(config.id)
@@ -3463,7 +3474,7 @@ class OrderBookRecoveryService(Response):
                 return self.reject("entries_paused", config, state)
             if not config.paper_session_id:
                 self.create_paper_session(config)
-            if getattr(config, "strategy_version", "baseline") == EXPERIMENT_VERSION:
+            if getattr(config, "strategy_version", "baseline") in EXPERIMENT_VERSIONS:
                 checked_side, checked = self.signal(config, state, features, current_time)
                 if checked_side != side:
                     return self.reject(checked.get("reject_reason") or "experimental_signal_changed", config, state)
@@ -3751,7 +3762,7 @@ class OrderBookRecoveryService(Response):
                     if indicated <= -trade.margin * float(config.stop_loss_percent_of_margin) / 100:
                         # Latch a stop intent, never book an indicative price as a fill.
                         return self.close_trade(trade, quote, indicated, "stop_loss", state, config, current_time)
-                if (getattr(config, "strategy_version", "baseline") == EXPERIMENT_VERSION
+                if (getattr(config, "strategy_version", "baseline") in EXPERIMENT_VERSIONS
                         and (current_time - trade.opened_at).total_seconds() >= experiment_settings(config.experiment_settings)["max_hold_seconds"]):
                     return self.close_trade(trade, current_price, pnl, "experimental_max_hold", state, config, current_time)
                 db.session.commit()
@@ -3761,11 +3772,26 @@ class OrderBookRecoveryService(Response):
             pnl = self.calculate_pnl(trade.side, trade.entry_price, current_price, trade.notional)
         target_profit = trade.margin * (float(config.take_profit_percent_of_margin) / 100)
         max_loss = trade.margin * (float(config.stop_loss_percent_of_margin) / 100)
+        if trade.execution_mode == "paper":
+            observed = (self.snapshot_for(trade.exchange, trade.symbol) or {}).get("metadata", {}).get("source_timestamp")
+            if isinstance(observed, (int, float)):
+                observed = datetime.utcfromtimestamp(observed / 1000 if observed > 1e11 else observed)
+            decision = self.parse_json(trade.decision_snapshot_json) or {}
+            decision = decision if isinstance(decision, dict) else {}
+            stats = decision.get("observed_excursions") or {}
+            stats = stats if isinstance(stats, dict) else {}
+            if isinstance(observed, datetime) and str(observed) != stats.get("last_source_time"):
+                stats.update(last_source_time=str(observed), samples=stats.get("samples", 0) + 1,
+                    mfe_gross_usdt=max(stats.get("mfe_gross_usdt", 0), pnl),
+                    mae_gross_usdt=min(stats.get("mae_gross_usdt", 0), pnl),
+                    basis="observed_executable_exit_quotes_only_not_continuous_path", post_exit="not_collected")
+                decision["observed_excursions"] = stats
+                trade.decision_snapshot_json = json.dumps(decision, default=str)
         if pnl >= target_profit:
             return self.close_trade(trade, current_price, pnl, "take_profit", state, config, current_time)
         if pnl <= -max_loss:
             return self.close_trade(trade, current_price, pnl, "stop_loss", state, config, current_time)
-        if trade.execution_mode == "paper" and getattr(config, "strategy_version", "baseline") == EXPERIMENT_VERSION:
+        if trade.execution_mode == "paper" and getattr(config, "strategy_version", "baseline") in EXPERIMENT_VERSIONS:
             if (current_time - trade.opened_at).total_seconds() >= experiment_settings(config.experiment_settings)["max_hold_seconds"]:
                 return self.close_trade(trade, current_price, pnl, "experimental_max_hold", state, config, current_time)
             direction, consensus = self.consensus_signal(config, current_time)
@@ -3784,9 +3810,13 @@ class OrderBookRecoveryService(Response):
                 "consensus": self.safe_json_payload(consensus)}
             decision["experiment_exit_evidence"] = (decision.get("experiment_exit_evidence", []) + [evidence])[-12:]
             trade.decision_snapshot_json = json.dumps(decision, default=str)
-            if consensus.get("configured_exchange_valid") and consensus.get("valid_exchanges_count", 0) >= config.min_valid_exchanges:
-                reason, monitor = exit_decision(config.experiment_settings, decision.get("experiment_exit_state"), trade.side,
-                    direction, source, current_time, trade.opened_at, pnl, trade.margin)
+            if config.strategy_version == CANDIDATE_VERSION or (consensus.get("configured_exchange_valid") and consensus.get("valid_exchanges_count", 0) >= config.min_valid_exchanges):
+                if config.strategy_version == CANDIDATE_VERSION:
+                    reason, monitor = candidate_exit(config, decision.get("experiment_exit_state"), trade.side,
+                        direction, consensus, source, current_time, trade.opened_at, pnl, trade.margin)
+                else:
+                    reason, monitor = exit_decision(config.experiment_settings, decision.get("experiment_exit_state"), trade.side,
+                        direction, source, current_time, trade.opened_at, pnl, trade.margin)
                 decision["experiment_exit_state"] = monitor
                 trade.decision_snapshot_json = json.dumps(decision, default=str)
                 if reason:

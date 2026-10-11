@@ -61,6 +61,11 @@ class SignalFeedbackService:
             "adaptive_min_valid_exchanges": base_valid,
             "blocked_side": None,
             "feedback_reject_reason": None,
+            "side_loss_streak_limit": int(config.side_loss_streak_limit),
+            "side_cooldown_seconds": int(config.side_cooldown_seconds),
+            "checked_side": side,
+            "evaluated_at": current_time.isoformat(),
+            "cooldown_until": None,
         }
         if not config.feedback_enabled or not side:
             return True, result
@@ -70,6 +75,8 @@ class SignalFeedbackService:
         if stats["loss_streak"] >= int(config.side_loss_streak_limit) and recent_side_trades:
             latest_loss = recent_side_trades[0]
             cooldown_until = latest_loss.closed_at + timedelta(seconds=int(config.side_cooldown_seconds))
+            result["cooldown_until"] = cooldown_until.isoformat()
+            result["last_loss_closed_at"] = latest_loss.closed_at.isoformat()
             if current_time < cooldown_until:
                 result["blocked_side"] = side
                 result["feedback_reject_reason"] = f"{side}_loss_streak_cooldown"

@@ -7,12 +7,15 @@ from pathlib import Path
 
 from replay_orderbooks import replay, source_hashes
 from src.OrderBookRecovery.AdaptiveBookV1 import AdaptiveBookV1
+from src.OrderBookRecovery.AdaptiveBookV2 import AdaptiveBookV2
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--development-input', required=True)
     parser.add_argument('--output', required=True)
+    parser.add_argument('--reference', choices=['baseline', 'adaptive_book_v1'], default='baseline')
+    parser.add_argument('--candidate', choices=['adaptive_book_v1', 'adaptive_book_v2'], default='adaptive_book_v1')
     parser.add_argument('--functional-smoke', action='store_true', help='Only pre-development 2026-10-08 smoke, NOT performance evidence')
     args = parser.parse_args()
     path = Path(args.development_input)
@@ -34,8 +37,10 @@ def main():
               'ml_mode': 'disabled'}
     results = []
     for fee, latency in ((.1, 250), (.15, 1000)):
-        for version in ('baseline', 'adaptive_book_v1'):
+        for version in (args.reference, args.candidate):
             AdaptiveBookV1._history.clear()
+            AdaptiveBookV2._history.clear()
+            AdaptiveBookV2._renewal.clear()
             result = replay(rows, {**config, 'strategy_version': version,
                 'paper_taker_fee_percent': fee, 'paper_latency_ms': latency}, 'VELVET/USDT', start,
                 baseline=False, end_time=end, funding_scenario=.1)
@@ -46,7 +51,8 @@ def main():
         'scope': 'pre-development functional smoke ONLY; not performance evidence' if args.functional_smoke else 'development only; no tuning, no evaluation opened',
         'limitations': ['short sample', 'executed flow unavailable', 'account fees assumed',
                         'funding adverse scenario, not exact cashflows', 'fixed latency; no queue/partial fills'],
-        'source_hashes': {**source_hashes(), 'src/OrderBookRecovery/AdaptiveBookV1.py':
+        'source_hashes': {**source_hashes(), 'src/OrderBookRecovery/AdaptiveBookV2.py':
+            hashlib.sha256((Path(__file__).resolve().parents[1] / 'src/OrderBookRecovery/AdaptiveBookV2.py').read_bytes()).hexdigest(), 'src/OrderBookRecovery/AdaptiveBookV1.py':
             hashlib.sha256((Path(__file__).resolve().parents[1] / 'src/OrderBookRecovery/AdaptiveBookV1.py').read_bytes()).hexdigest()},
         'results': results}
     with Path(args.output).open('x') as output:

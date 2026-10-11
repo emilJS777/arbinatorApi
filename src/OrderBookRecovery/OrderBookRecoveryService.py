@@ -1039,6 +1039,8 @@ class OrderBookRecoveryService(Response):
         latest_ml = self.ml_snapshot_to_dict(ml_snapshots[0]) if ml_snapshots else None
         decision = self.parse_json(trade.decision_snapshot_json)
         decision = decision if isinstance(decision, dict) else {}
+        execution_config = self.parse_json(trade.execution_config_json)
+        execution_config = execution_config if isinstance(execution_config, dict) else {}
         return {
             "trade": self.trade_to_dict(trade),
             "summary": {
@@ -1057,6 +1059,12 @@ class OrderBookRecoveryService(Response):
                 "is_archived": trade.is_archived,
             },
             "decision_snapshot": self.parse_json(trade.decision_snapshot_json),
+            "execution_config": {key: value for key, value in execution_config.items()
+                if key in {"strategy_version", "experiment_settings", "execution_mode", "paper_session_id", "exchange", "symbol",
+                    "take_profit_percent_of_margin", "stop_loss_percent_of_margin", "leverage", "paper_latency_ms",
+                    "paper_taker_fee_percent", "max_snapshot_age_seconds", "min_valid_exchanges", "min_confirming_exchanges",
+                    "min_consensus_ratio", "max_spread_percent", "momentum_window_snapshots", "long_imbalance_threshold",
+                    "short_imbalance_threshold", "exclude_anomalous_imbalance", "imbalance_anomaly_min", "imbalance_anomaly_max"}},
             "per_exchange_features": self.parse_json(trade.per_exchange_features_json or trade.signal_per_exchange_features_json) or [],
             "signal": {
                 "consensus_direction": trade.consensus_direction or trade.signal_consensus_direction,
@@ -3767,6 +3775,15 @@ class OrderBookRecoveryService(Response):
                 source = datetime.utcfromtimestamp(source / 1000 if source > 1e11 else source)
             decision = self.parse_json(trade.decision_snapshot_json) or {}
             # Unavailable confirmation is not evidence of an observed reversal.
+            evidence = {"evaluated_at": current_time.isoformat(), "source_timestamp": str(source),
+                "side": trade.side, "direction": direction,
+                "classification": "unavailable" if not consensus.get("configured_exchange_valid") or consensus.get("valid_exchanges_count", 0) < config.min_valid_exchanges
+                    else "observed_reversal" if direction and direction != trade.side
+                    else "loss_of_confirmation" if not direction else "confirmed_same_direction",
+                "reject_reason": consensus.get("reject_reason"),
+                "consensus": self.safe_json_payload(consensus)}
+            decision["experiment_exit_evidence"] = (decision.get("experiment_exit_evidence", []) + [evidence])[-12:]
+            trade.decision_snapshot_json = json.dumps(decision, default=str)
             if consensus.get("configured_exchange_valid") and consensus.get("valid_exchanges_count", 0) >= config.min_valid_exchanges:
                 reason, monitor = exit_decision(config.experiment_settings, decision.get("experiment_exit_state"), trade.side,
                     direction, source, current_time, trade.opened_at, pnl, trade.margin)
@@ -3995,6 +4012,7 @@ class OrderBookRecoveryService(Response):
             exit_price = fill["price"]
             pnl = self.calculate_pnl(trade.side, trade.entry_price, exit_price, trade.notional)
             trade.gross_pnl = pnl
+            trade.live_exit_fee = fill["fee"]
             trade.total_fee = float(trade.live_entry_fee or 0) + fill["fee"]
             pnl -= trade.total_fee
             pnl += float(trade.funding_pnl or 0)

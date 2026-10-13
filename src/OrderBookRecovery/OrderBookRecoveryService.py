@@ -21,6 +21,7 @@ from src import db
 from src.OrderBookRecovery.AdaptiveBookV1 import AdaptiveBookV1, VERSION as EXPERIMENT_VERSION, settings as experiment_settings, exit_decision
 from src.OrderBookRecovery.AdaptiveBookV2 import AdaptiveBookV2, VERSION as CANDIDATE_VERSION, exit_decision as candidate_exit
 from src.OrderBookRecovery.PaperEntryMeasurement import observe as observe_entry_quality
+from src.OrderBookRecovery.PaperShadowMeasurement import observe as observe_shadow_price
 EXPERIMENT_VERSIONS = {EXPERIMENT_VERSION, CANDIDATE_VERSION}
 from src.OrderBookRecovery.RuntimeDiagnostics import runtime_diagnostics
 from src.OrderBookRecovery.PaperAbandonment import abandonment_mode_error
@@ -542,6 +543,11 @@ class OrderBookRecoveryService(Response):
         trade.live_status, trade.result = "paper_cancelled", "cancelled"
         trade.reason_close, trade.closed_at, trade.pnl = f"pending_entry_{reason}", now, 0
         trade.live_error = trade.reason_close
+        decision = self.parse_json(trade.decision_snapshot_json) or {}
+        decision["pending_cancellation"] = {"reason": reason, "cancelled_at": now.isoformat(),
+            "requested_at": str(trade.opened_at), "expires_at": str(trade.pending_entry_expires_at)}
+        trade.decision_snapshot_json = json.dumps(decision, default=str)
+        self.start_paper_shadow(trade, now, "rejected_pending_entry")
         self.observe_signal("pending_cancelled", trade.reason_close)
         slot = db.session.get(ExecutionSlot, trade.strategy_config_id)
         if slot and slot.trade_id == trade.id:
@@ -3697,11 +3703,21 @@ class OrderBookRecoveryService(Response):
                 return None
             features, error = self.features(config, snapshot)
             signal, consensus = self.signal(config, state, features, current_time, pending_trade_id=trade.id)
+            decision = self.parse_json(trade.decision_snapshot_json) or {}
+            decision["pending_revalidation"] = {
+                "evaluated_at": current_time.isoformat(), "book_source_at": str(source),
+                "requested_at": trade.opened_at.isoformat(), "expected_side": trade.side,
+                "selected_side": signal, "consensus": self.safe_json_payload(consensus),
+                "final_reject_reason": (consensus.get("reject_reason") or "signal_changed") if signal != trade.side else None,
+                "direction_rejections": direction_rejections(config, consensus)}
+            trade.decision_snapshot_json = json.dumps(decision, default=str)
             if signal != trade.side:
                 return self.cancel_paper_entry(trade, consensus.get("reject_reason") or "signal_changed", current_time)
             reason = self.feedback_snapshot(config, signal, consensus, current_time).get("feedback_reject_reason")
             reason = reason or self.profit_protection_rejection(config, state, features, signal, consensus, current_time)
             reason = reason or self.risk_rejection(active_config, state, features, current_time, pending_trade_id=trade.id)
+            decision["pending_revalidation"]["final_reject_reason"] = reason
+            trade.decision_snapshot_json = json.dumps(decision, default=str)
             if reason:
                 return self.cancel_paper_entry(trade, reason, current_time)
             cap = min(self.bounded_margin(config, current_time), self.bounded_margin(active_config, current_time))
@@ -3725,6 +3741,10 @@ class OrderBookRecoveryService(Response):
             trade.live_entry_fee = fill["fee"]
             trade.total_fee = fill["fee"]
             trade.opened_at = current_time
+            decision["paper_entry_timing"] = {"requested_at": decision["pending_revalidation"]["requested_at"],
+                "filled_at": current_time.isoformat(), "fill_book_source_at": str(source),
+                "measurement_origin": "actual_fill_time"}
+            trade.decision_snapshot_json = json.dumps(decision, default=str)
             trade.live_status = None
             trade.live_error = None
             slot = db.session.get(ExecutionSlot, trade.strategy_config_id)
@@ -3917,6 +3937,74 @@ class OrderBookRecoveryService(Response):
             guardian = PositionGuardian(self)
             if guardian.prepare_legacy(config, trade):
                 guardian.funding(config, trade, datetime.utcnow())
+        self.observe_recent_paper_shadows(datetime.utcnow())
+
+    def measure_pending_exit(self, trade, config, now):
+        if trade.execution_mode != "paper" or config.strategy_version not in EXPERIMENT_VERSIONS:
+            return
+        snapshot = self.snapshot_for(trade.exchange, trade.symbol)
+        quote = self.paper_fill(snapshot, "short" if trade.side == "long" else "long",
+                                trade.amount, config, now, protective=True)
+        if not quote:
+            return
+        source = snapshot.get("metadata", {}).get("source_timestamp")
+        if isinstance(source, (int, float)):
+            source = datetime.utcfromtimestamp(source / 1000 if source > 1e11 else source)
+        decision = self.parse_json(trade.decision_snapshot_json) or {}
+        decision["entry_quality_measurement"] = observe_entry_quality(
+            decision.get("entry_quality_measurement"), source=source, now=now, opened_at=trade.opened_at,
+            gross=self.calculate_pnl(trade.side, trade.entry_price, quote["price"], trade.notional),
+            entry_fee=trade.live_entry_fee, exit_fee=quote["fee"])
+        trade.decision_snapshot_json = json.dumps(decision, default=str)
+
+    def start_paper_shadow(self, trade, now, phase):
+        frozen = self.parse_json(trade.execution_config_json) or {}
+        if trade.execution_mode != "paper" or frozen.get("strategy_version") not in EXPERIMENT_VERSIONS:
+            return
+        decision = self.parse_json(trade.decision_snapshot_json) or {}
+        decision["paper_shadow_prices"] = {"phase": phase, "event_at": now.isoformat(),
+            "status": "awaiting_reference", "basis": "depth_quotes_only_not_fills_or_net_pnl",
+            "scope": "recent_reserved_candidates_only_not_all_rejected_signals",
+            "max_tracking_seconds": 125, "max_rows_per_tick": 20}
+        trade.decision_snapshot_json = json.dumps(decision, default=str)
+
+    def observe_recent_paper_shadows(self, now):
+        # Existing worker, bounded recent rows, no exchange calls or new order paths.
+        try:
+            trades = StrategyRunTrade.query.filter(
+                StrategyRunTrade.execution_mode == "paper", StrategyRunTrade.abandoned_at.is_(None),
+                StrategyRunTrade.closed_at >= now - timedelta(seconds=125),
+                StrategyRunTrade.closed_at <= now).order_by(StrategyRunTrade.closed_at.desc()).limit(20).all()
+            for trade in trades:
+                decision = self.parse_json(trade.decision_snapshot_json) or {}
+                shadow = decision.get("paper_shadow_prices")
+                if not shadow:
+                    continue  # Never reconstruct old histories after deployment.
+                # Lock the row so other workers/archive cannot lose a JSON update.
+                trade = StrategyRunTrade.query.filter_by(id=trade.id).populate_existing().with_for_update(skip_locked=True).first()
+                if not trade or trade.abandoned_at:
+                    continue
+                decision = self.parse_json(trade.decision_snapshot_json) or {}
+                shadow = decision.get("paper_shadow_prices")
+                config = self.trade_config(db.session.get(OrderBookPatternStrategyConfig, trade.strategy_config_id), trade)
+                snapshot = self.snapshot_for(trade.exchange, trade.symbol)
+                row = self.exchange_feature(config, snapshot, now, protective=True) if snapshot else {}
+                received = (snapshot or {}).get("updated_at")
+                if not row.get("valid") or (received and received > now):
+                    shadow = {**shadow, "last_reject_reason": row.get("reject_reason") or "no_fresh_book"}
+                else:
+                    normalized, error = OrderBookNormalizer.normalize(snapshot['order_book'])
+                    quote = None if error else consume_book(normalized, "short" if trade.side == "long" else "long", trade.amount, 0)
+                    source = snapshot.get('metadata', {}).get('source_timestamp')
+                    if isinstance(source, (int, float)):
+                        source = datetime.utcfromtimestamp(source / 1000 if source > 1e11 else source)
+                    shadow = observe_shadow_price(shadow, source, now, quote['price'], trade.side) if quote else {**shadow, 'last_reject_reason': 'insufficient_depth'}
+                decision['paper_shadow_prices'] = shadow
+                trade.decision_snapshot_json = json.dumps(decision, default=str)
+            db.session.commit()
+        except Exception as error:
+            db.session.rollback()
+            log_incident(error, "paper_shadow_prices")
 
     def exchange_tpsl_close_reason(self, trade, current_price):
         if trade.side == "long":
@@ -3986,6 +4074,14 @@ class OrderBookRecoveryService(Response):
         if trade.closed_at:
             return self.trade_to_dict(trade)
         config = self.trade_config(config, trade)
+        # Observe before delayed-close returns, after refresh and with immutable parameters.
+        if trade.execution_mode == "paper" and config.strategy_version in EXPERIMENT_VERSIONS:
+            try:
+                self.measure_pending_exit(trade, config, current_time)
+            except Exception as error:
+                # Optional evidence collection must never veto a protective close.
+                log_incident(error, "paper_exit_measurement")
+            db.session.flush()
         if trade.execution_mode != "live" and not trade.paper_close_requested_at:
             trade.paper_close_requested_at = current_time
             trade.paper_close_reason = reason
@@ -4060,6 +4156,7 @@ class OrderBookRecoveryService(Response):
         trade.result = "win" if pnl > 0 else "loss"
         trade.reason_close = reason
         trade.closed_at = current_time
+        self.start_paper_shadow(trade, current_time, "post_exit")
         trade.holding_seconds = (trade.closed_at - trade.opened_at).total_seconds() if trade.opened_at else None
         self.update_ml_snapshots_for_trade(trade)
         if trade.execution_mode != "live":

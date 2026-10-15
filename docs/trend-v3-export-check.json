@@ -1,0 +1,101 @@
+{
+  "status": "inconclusive",
+  "duplicate_ids_removed": 42,
+  "unique_ids": 161,
+  "files": [
+    {
+      "file": "orderbook-recovery-trades-2026-10-11-12-05.json",
+      "sha256": "1171dc4e7c3e47982ca5e8ed6e522234e5f71d7907cd65132fb47c83a84690dd",
+      "gross_pnl": -0.05470000000001071,
+      "total_fee": 0.4367997,
+      "net_pnl": -0.49149970000001075,
+      "trades": 16,
+      "wins": 0,
+      "net_expectancy": -0.030718731250000672,
+      "closed_trade_drawdown_usdt": 0.49149970000001075,
+      "turnover_entry_plus_exit_usdt": 436.7997,
+      "candidate_retained": null,
+      "candidate_rejected": null,
+      "candidate_result": "unavailable: no continuous pre-entry 60-second history; not a replay"
+    },
+    {
+      "file": "orderbook-recovery-trades-2026-10-13-17-44.json",
+      "sha256": "5e19d2fa142187afe05d4de0e78f58790a476a1e2e8864eff99acae7821504b0",
+      "gross_pnl": -0.04339999999999885,
+      "total_fee": 0.3255308,
+      "net_pnl": -0.3689307999999989,
+      "trades": 12,
+      "wins": 1,
+      "net_expectancy": -0.03074423333333324,
+      "closed_trade_drawdown_usdt": 0.3689307999999989,
+      "turnover_entry_plus_exit_usdt": 325.5308,
+      "candidate_retained": null,
+      "candidate_rejected": null,
+      "candidate_result": "unavailable: no continuous pre-entry 60-second history; not a replay"
+    },
+    {
+      "file": "orderbook-recovery-trades-2026-10-14-18-56.json",
+      "sha256": "91df232f30d3d1d5fe9637e46c253d226dca1a5c4995c6ed16e30c07327afc6f",
+      "gross_pnl": 0.10089999999999821,
+      "total_fee": 0.4086747,
+      "net_pnl": -0.3077747000000018,
+      "trades": 15,
+      "wins": 4,
+      "net_expectancy": -0.020518313333333454,
+      "closed_trade_drawdown_usdt": 0.3557882999999998,
+      "turnover_entry_plus_exit_usdt": 408.6747,
+      "candidate_retained": null,
+      "candidate_rejected": null,
+      "candidate_result": "unavailable: no continuous pre-entry 60-second history; not a replay"
+    },
+    {
+      "file": "orderbook-recovery-trades-2026-10-15-08-54.json",
+      "sha256": "d10617e6afd568f8638f252b97aeb35592033bdd60e50500f4b9d55b00e49398",
+      "gross_pnl": -0.0953000000000001,
+      "total_fee": 0.6531061,
+      "net_pnl": -0.7484061000000002,
+      "trades": 24,
+      "wins": 6,
+      "net_expectancy": -0.031183587500000005,
+      "closed_trade_drawdown_usdt": 0.7897279000000006,
+      "turnover_entry_plus_exit_usdt": 653.1061,
+      "candidate_retained": null,
+      "candidate_rejected": null,
+      "candidate_result": "unavailable: no continuous pre-entry 60-second history; not a replay"
+    }
+  ],
+  "groups": [
+    {
+      "version": "adaptive_book_v1",
+      "session": "a22584ca-44ed-4607-85de-0c0fcae68b90",
+      "config_hash": "15f7c4a5996b",
+      "gross_pnl": -0.05470000000001071,
+      "total_fee": 0.4367997,
+      "net_pnl": -0.49149970000001075,
+      "trades": 16,
+      "wins": 0,
+      "net_expectancy": -0.030718731250000672,
+      "closed_trade_drawdown_usdt": 0.49149970000001075,
+      "turnover_entry_plus_exit_usdt": 436.7997,
+      "candidate_retained": null,
+      "candidate_rejected": null,
+      "candidate_result": "unavailable: no continuous pre-entry 60-second history; not a replay"
+    },
+    {
+      "version": "adaptive_book_v2",
+      "session": "ac2b2d86-8323-4a42-96bf-361d7607aafc",
+      "config_hash": "b9d4b3b604af",
+      "gross_pnl": -0.13869999999999896,
+      "total_fee": 0.9786369,
+      "net_pnl": -1.117336899999999,
+      "trades": 36,
+      "wins": 7,
+      "net_expectancy": -0.031037136111111086,
+      "closed_trade_drawdown_usdt": 1.117336899999999,
+      "turnover_entry_plus_exit_usdt": 978.6369,
+      "candidate_retained": null,
+      "candidate_rejected": null,
+      "candidate_result": "unavailable: no continuous pre-entry 60-second history; not a replay"
+    }
+  ]
+}

@@ -8,16 +8,20 @@ from pathlib import Path
 from replay_orderbooks import replay, source_hashes
 from src.OrderBookRecovery.AdaptiveBookV1 import AdaptiveBookV1
 from src.OrderBookRecovery.AdaptiveBookV2 import AdaptiveBookV2
+from src.OrderBookRecovery.AdaptiveTrendV3 import AdaptiveTrendV3
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--development-input', required=True)
     parser.add_argument('--output', required=True)
-    parser.add_argument('--reference', choices=['baseline', 'adaptive_book_v1'], default='baseline')
-    parser.add_argument('--candidate', choices=['adaptive_book_v1', 'adaptive_book_v2'], default='adaptive_book_v1')
+    parser.add_argument('--reference', choices=['baseline', 'adaptive_book_v1', 'adaptive_book_v2'], default='baseline')
+    parser.add_argument('--candidate', choices=['adaptive_book_v1', 'adaptive_book_v2', 'adaptive_trend_v3'], default='adaptive_book_v1')
+    parser.add_argument('--config', help='Saved paper configuration JSON, required for v3 comparison')
     parser.add_argument('--functional-smoke', action='store_true', help='Only pre-development 2026-10-08 smoke, NOT performance evidence')
     args = parser.parse_args()
+    if args.candidate == 'adaptive_trend_v3' and (not args.config or args.reference != 'adaptive_book_v2'):
+        parser.error('v3 comparison requires --reference adaptive_book_v2 and --config')
     path = Path(args.development_input)
     rows = []
     start, end = (datetime(2026, 10, 8), datetime(2026, 10, 9)) if args.functional_smoke else (datetime(2026, 10, 9), datetime(2026, 10, 23))
@@ -25,6 +29,8 @@ def main():
         for line in stream:
             row = json.loads(line)
             received = row.get('received_at')
+            if args.candidate == 'adaptive_trend_v3' and not isinstance(received, (int, float)):
+                raise SystemExit('Missing receipt timestamps: no v3 replay')
             if received and not start <= datetime.utcfromtimestamp(received / 1000) < end:
                 raise SystemExit('Input dates outside selected development/functional-smoke bounds; evaluation is forbidden')
             rows.append(row)
@@ -35,23 +41,35 @@ def main():
               'take_profit_percent_of_margin': 1.8, 'stop_loss_percent_of_margin': .9,
               'base_margin_usdt': 7, 'max_position_margin_usdt': 7, 'leverage': 1,
               'ml_mode': 'disabled'}
+    if args.config:
+        saved = json.loads(Path(args.config).read_text())
+        if saved.get('execution_mode') != 'paper':
+            raise SystemExit('Only explicit paper config accepted')
+        config.update(saved)
+        config.update(execution_mode='paper', live_kill_switch=True, live_enabled_confirmation=False, ml_mode='disabled')
     results = []
-    for fee, latency in ((.1, 250), (.15, 1000)):
+    for fee, latency in ((config.get('paper_taker_fee_percent', .1), config.get('paper_latency_ms', 250)),
+                         (max(.15, config.get('paper_taker_fee_percent', .1)), max(1000, config.get('paper_latency_ms', 250)))):
         for version in (args.reference, args.candidate):
             AdaptiveBookV1._history.clear()
             AdaptiveBookV2._history.clear()
             AdaptiveBookV2._renewal.clear()
+            AdaptiveTrendV3._history.clear()
+            AdaptiveTrendV3._renewal.clear()
+            AdaptiveTrendV3._trend.clear()
             result = replay(rows, {**config, 'strategy_version': version,
                 'paper_taker_fee_percent': fee, 'paper_latency_ms': latency}, 'VELVET/USDT', start,
                 baseline=False, end_time=end, funding_scenario=.1)
             result['variant'] = version
             results.append(result)
     report = {'status': 'inconclusive', 'input': path.name,
+        'config_sha256': hashlib.sha256(Path(args.config).read_bytes()).hexdigest() if args.config else None,
         'input_sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'input_rows': len(rows),
         'scope': 'pre-development functional smoke ONLY; not performance evidence' if args.functional_smoke else 'development only; no tuning, no evaluation opened',
         'limitations': ['short sample', 'executed flow unavailable', 'account fees assumed',
                         'funding adverse scenario, not exact cashflows', 'fixed latency; no queue/partial fills'],
-        'source_hashes': {**source_hashes(), 'src/OrderBookRecovery/AdaptiveBookV2.py':
+        'source_hashes': {**source_hashes(), 'src/OrderBookRecovery/AdaptiveTrendV3.py':
+            hashlib.sha256((Path(__file__).resolve().parents[1] / 'src/OrderBookRecovery/AdaptiveTrendV3.py').read_bytes()).hexdigest(), 'src/OrderBookRecovery/AdaptiveBookV2.py':
             hashlib.sha256((Path(__file__).resolve().parents[1] / 'src/OrderBookRecovery/AdaptiveBookV2.py').read_bytes()).hexdigest(), 'src/OrderBookRecovery/AdaptiveBookV1.py':
             hashlib.sha256((Path(__file__).resolve().parents[1] / 'src/OrderBookRecovery/AdaptiveBookV1.py').read_bytes()).hexdigest()},
         'results': results}

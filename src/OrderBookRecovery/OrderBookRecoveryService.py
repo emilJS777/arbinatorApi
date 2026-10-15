@@ -20,9 +20,10 @@ from sqlalchemy.exc import IntegrityError
 from src import db
 from src.OrderBookRecovery.AdaptiveBookV1 import AdaptiveBookV1, VERSION as EXPERIMENT_VERSION, settings as experiment_settings, exit_decision
 from src.OrderBookRecovery.AdaptiveBookV2 import AdaptiveBookV2, VERSION as CANDIDATE_VERSION, exit_decision as candidate_exit
+from src.OrderBookRecovery.AdaptiveTrendV3 import AdaptiveTrendV3, VERSION as TREND_VERSION
 from src.OrderBookRecovery.PaperEntryMeasurement import observe as observe_entry_quality
 from src.OrderBookRecovery.PaperShadowMeasurement import observe as observe_shadow_price
-EXPERIMENT_VERSIONS = {EXPERIMENT_VERSION, CANDIDATE_VERSION}
+EXPERIMENT_VERSIONS = {EXPERIMENT_VERSION, CANDIDATE_VERSION, TREND_VERSION}
 from src.OrderBookRecovery.RuntimeDiagnostics import runtime_diagnostics
 from src.OrderBookRecovery.PaperAbandonment import abandonment_mode_error
 from src.OrderBookRecovery.FuturesSnapshotStore import FuturesSnapshotStore as OrderBookSnapshotStore
@@ -474,6 +475,7 @@ class OrderBookRecoveryService(Response):
     def stop(self, reason="manual_stop"):
         AdaptiveBookV1.reset(self.get_or_create_config().id)
         AdaptiveBookV2.reset(self.get_or_create_config().id)
+        AdaptiveTrendV3.clear_config(self.get_or_create_config().id)
         config = self.get_or_create_config()
         config = self.lock_config(config.id)
         config.enabled = False
@@ -3119,9 +3121,10 @@ class OrderBookRecoveryService(Response):
             self.observe_signal("consensus_passed" if side else "consensus_rejected", consensus.get("reject_reason"), consensus)
             if getattr(config, "strategy_version", "baseline") in EXPERIMENT_VERSIONS:
                 args = (config, side, consensus, self.snapshot_for(config.exchange, config.symbol), current_time, self.bounded_margin(config, current_time))
-                if config.strategy_version == CANDIDATE_VERSION:
+                if config.strategy_version in {CANDIDATE_VERSION, TREND_VERSION}:
                     previous = self.closed_trades_query(config).filter_by(execution_mode="paper", paper_session_id=config.paper_session_id).order_by(StrategyRunTrade.closed_at.desc()).first()
-                    side, report = AdaptiveBookV2.entry(*args, previous=previous)
+                    engine = AdaptiveTrendV3 if config.strategy_version == TREND_VERSION else AdaptiveBookV2
+                    side, report = engine.entry(*args, previous=previous)
                 else:
                     side, report = AdaptiveBookV1.entry(*args)
                 consensus["experiment"] = report
@@ -3837,8 +3840,8 @@ class OrderBookRecoveryService(Response):
                 "consensus": self.safe_json_payload(consensus)}
             decision["experiment_exit_evidence"] = (decision.get("experiment_exit_evidence", []) + [evidence])[-12:]
             trade.decision_snapshot_json = json.dumps(decision, default=str)
-            if config.strategy_version == CANDIDATE_VERSION or (consensus.get("configured_exchange_valid") and consensus.get("valid_exchanges_count", 0) >= config.min_valid_exchanges):
-                if config.strategy_version == CANDIDATE_VERSION:
+            if config.strategy_version in {CANDIDATE_VERSION, TREND_VERSION} or (consensus.get("configured_exchange_valid") and consensus.get("valid_exchanges_count", 0) >= config.min_valid_exchanges):
+                if config.strategy_version in {CANDIDATE_VERSION, TREND_VERSION}:
                     reason, monitor = candidate_exit(config, decision.get("experiment_exit_state"), trade.side,
                         direction, consensus, source, current_time, trade.opened_at, pnl, trade.margin)
                 else:
